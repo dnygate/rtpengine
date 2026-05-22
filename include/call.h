@@ -449,6 +449,7 @@ struct packet_stream {
 	rtp_stats_ht		rtp_stats;				/* LOCK: call->master_lock */
 	struct rtp_stats	*rtp_stats_cache;
 	enum endpoint_learning		el_flags;
+	uint32_t			force_egress_ssrc;	/* 0 = unset; non-zero overrides every egress RTP SSRC at media_packet_encrypt() */
 
 #if RTP_LOOP_PROTECT
 	/* LOCK: ps->lock: */
@@ -776,6 +777,12 @@ struct call {
 	/* everything below is protected by the master_lock */
 	monologues_q		monologues;	/* call_monologue */
 	medias_q		medias;		/* call_media */
+	/* opensips-edge: when true, __determine_rtpext_handler() in
+	 * daemon/media_socket.c picks rtpext_printer_extmap even when
+	 * neither side declared extmap in SDP. Set via the
+	 * `force-strip-extmap` NG flag (sdp_ng_flags::force_strip_extmap),
+	 * propagated in __fill_stream(). Sticks for the call's lifetime. */
+	bool			force_strip_extmap;
 	str_ml_ht		tags;
 	str_ml_ht		viabranches;
 	str_ml_ht		labels;

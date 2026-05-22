@@ -2071,6 +2071,7 @@ int main(int argc, char **argv) {
 	codec_timers_launch();
 
 	ilog(LOG_INFO, "Startup complete, version %s", RTPENGINE_VERSION);
+	ilog(LOG_INFO, "SSRC-egress patch v5 active (SIP-semantic per-side, opensips-edge fork)");
 	service_notify("READY=1\n");
 
 	// reap threads as they shut down during run time
