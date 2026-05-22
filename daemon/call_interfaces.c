@@ -553,6 +553,78 @@ INLINE void ng_sdes_option(str *s, unsigned int idx, helper_arg arg) {
 	}
 }
 
+/* Parse a single SSRC value from a string: hex (0x...) or decimal.
+ * Returns 0 on parse error or sentinel zero value. */
+static uint32_t ng_parse_ssrc_value(const str *s) {
+	if (!s || !s->len)
+		return 0;
+	char buf[32];
+	size_t n = s->len < sizeof(buf) - 1 ? (size_t)s->len : sizeof(buf) - 1;
+	memcpy(buf, s->s, n);
+	buf[n] = '\0';
+	char *end = NULL;
+	unsigned long v = strtoul(buf, &end, 0);
+	if (end == buf || v == 0 || v > UINT32_MAX) {
+		ilog(LOG_WARN, "Invalid SSRC value: '" STR_FORMAT "'", STR_FMT(s));
+		return 0;
+	}
+	return (uint32_t)v;
+}
+
+/* SSRC dict iterator -- parses { egress-to-offerer: <int>,
+ * egress-to-answerer: <int>, ingress: <int> }. `egress-to-offerer`
+ * targets streams whose monologue tag matches from-tag (use when
+ * the SFU is the offerer, e.g. SFU-originated outbound calls).
+ * `egress-to-answerer` targets streams whose tag does NOT match
+ * from-tag (use when the SFU is the answerer, e.g. inbound calls).
+ * `ingress` is reserved. */
+static void call_ng_flags_ssrc(const ng_parser_t *parser, str *key, parser_arg value,
+		helper_arg arg) {
+	sdp_ng_flags *out = arg.flags;
+	str s = STR_NULL;
+	switch (__csh_lookup(key)) {
+		case CSH_LOOKUP("egress-to-offerer"):
+			if (parser->get_str(value, &s)) {
+				uint32_t v = ng_parse_ssrc_value(&s);
+				if (v) {
+					out->ssrc_force.egress_to_offerer = v;
+					ilog(LOG_DEBUG,
+						"SSRC-egress: parsed dict SSRC.egress-to-offerer=0x%08x", v);
+				}
+			}
+			break;
+		case CSH_LOOKUP("egress-to-answerer"):
+			if (parser->get_str(value, &s)) {
+				uint32_t v = ng_parse_ssrc_value(&s);
+				if (v) {
+					out->ssrc_force.egress_to_answerer = v;
+					ilog(LOG_DEBUG,
+						"SSRC-egress: parsed dict SSRC.egress-to-answerer=0x%08x", v);
+				}
+			}
+			break;
+		case CSH_LOOKUP("ingress"):
+			ilog(LOG_WARN, "SSRC.ingress parsed but not yet implemented");
+			break;
+		default:
+			ilog(LOG_WARN, "Unknown SSRC dict key: '" STR_FORMAT "'", STR_FMT(key));
+	}
+}
+
+/* String-flag form: SSRC-egress-to-offerer=<value>. */
+INLINE void ng_ssrc_egress_to_offerer_string(str *s, unsigned int idx, helper_arg arg) {
+	sdp_ng_flags *out = arg.flags;
+	uint32_t v = ng_parse_ssrc_value(s);
+	if (v) out->ssrc_force.egress_to_offerer = v;
+}
+
+/* String-flag form: SSRC-egress-to-answerer=<value>. */
+INLINE void ng_ssrc_egress_to_answerer_string(str *s, unsigned int idx, helper_arg arg) {
+	sdp_ng_flags *out = arg.flags;
+	uint32_t v = ng_parse_ssrc_value(s);
+	if (v) out->ssrc_force.egress_to_answerer = v;
+}
+
 INLINE void ng_osrtp_option(str *s, unsigned int idx, helper_arg arg) {
 	sdp_ng_flags *out = arg.flags;
 
@@ -1348,6 +1420,14 @@ void call_ng_flags_flags(str *s, unsigned int idx, helper_arg arg) {
 		case CSH_LOOKUP("strip extmap"):
 			call_ng_flags_str_ht(STR_PTR("all"), 0, &out->rtpext_strip);
 			break;
+		case CSH_LOOKUP("force-strip-extmap"):
+		case CSH_LOOKUP("force strip extmap"):
+			/* opensips-edge: force the extmap printer at egress even when
+			 * neither side declared extmap in SDP. Sticks on struct call
+			 * via __fill_stream() propagation. See media_socket.c
+			 * __determine_rtpext_handler(). */
+			out->force_strip_extmap = true;
+			break;
 		case CSH_LOOKUP("symmetric-codecs"):
 		case CSH_LOOKUP("symmetric codecs"):
 			ilog(LOG_INFO, "Ignoring obsolete flag `symmetric-codecs`");
@@ -1390,6 +1470,11 @@ void call_ng_flags_flags(str *s, unsigned int idx, helper_arg arg) {
 
 			/* OSRTP */
 			if (call_ng_flags_prefix(s, "OSRTP-", ng_osrtp_option, out))
+				return;
+			/* SSRC.egress force, SIP-semantic per-side string-flag forms. */
+			if (call_ng_flags_prefix(s, "SSRC-egress-to-offerer=", ng_ssrc_egress_to_offerer_string, out))
+				return;
+			if (call_ng_flags_prefix(s, "SSRC-egress-to-answerer=", ng_ssrc_egress_to_answerer_string, out))
 				return;
 			/* replacing SDP body parts */
 			if (call_ng_flags_prefix(s, "replace-", call_ng_flags_replace, out))
@@ -2155,6 +2240,36 @@ void call_ng_main_flags(const ng_parser_t *parser, str *key, parser_arg value, h
 		case CSH_LOOKUP("osrtp"):
 			call_ng_flags_str_list(parser, value, ng_osrtp_option, out);
 			break;
+		case CSH_LOOKUP("SSRC"):
+		case CSH_LOOKUP("ssrc"):
+			parser->dict_iter(parser, value, call_ng_flags_ssrc, out);
+			break;
+		case CSH_LOOKUP("SSRC-egress-to-offerer"): {
+			/* reuse outer-scope `str s` from call_ng_main_flags to avoid
+			 * -Wshadow warning; rtpengine builds with -Wshadow enabled */
+			str ssrc_s = STR_NULL;
+			if (parser->get_str(value, &ssrc_s)) {
+				uint32_t v = ng_parse_ssrc_value(&ssrc_s);
+				if (v) {
+					out->ssrc_force.egress_to_offerer = v;
+					ilog(LOG_DEBUG,
+						"SSRC-egress: parsed top-level egress-to-offerer=0x%08x", v);
+				}
+			}
+			break;
+		}
+		case CSH_LOOKUP("SSRC-egress-to-answerer"): {
+			str ssrc_s = STR_NULL;
+			if (parser->get_str(value, &ssrc_s)) {
+				uint32_t v = ng_parse_ssrc_value(&ssrc_s);
+				if (v) {
+					out->ssrc_force.egress_to_answerer = v;
+					ilog(LOG_DEBUG,
+						"SSRC-egress: parsed top-level egress-to-answerer=0x%08x", v);
+				}
+			}
+			break;
+		}
 		case CSH_LOOKUP("output-destination"):
 		case CSH_LOOKUP("output-dest"):
 		case CSH_LOOKUP("output-file"):

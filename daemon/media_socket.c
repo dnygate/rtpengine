@@ -2510,7 +2510,16 @@ static void __determine_rtpext_handler(struct call_media *in, struct call_media 
 	if (!sh || !out)
 		return;
 
-	if (in->extmap.length || out->extmap.length)
+	/* opensips-edge: when force-strip-extmap was set on any NG
+	 * command in this call, force the extmap printer at egress
+	 * even when neither side declares extmap in SDP. This strips
+	 * undeclared wire-level RFC-5285 extensions (e.g. Telephone.app
+	 * audio-level / transport-cc) that mediasoup relays byte-for-
+	 * byte and the transcoder otherwise re-stamps onto egress
+	 * packets. Set selectively on routes that target strict-
+	 * firmware endpoints (Grandstream GXP1628). */
+	bool force_strip = (out && out->call && out->call->force_strip_extmap);
+	if (force_strip || in->extmap.length || out->extmap.length)
 		sh->rtpext = &rtpext_printer_extmap;
 	else
 		sh->rtpext = &rtpext_printer_copy;
@@ -3060,6 +3069,35 @@ static void media_packet_set_encrypt(struct packet_handler_ctx *phc, struct sink
 
 int media_packet_encrypt(rewrite_func encrypt_func, struct packet_stream *out, struct media_packet *mp) {
 	int ret = 0x00; // 0x01 = error, 0x02 = update
+
+	/* SSRC.egress force: rewrite the RTP header's SSRC field BEFORE
+	 * the encrypt_func == NULL early-return below. Plain RTP/AVP
+	 * egress (e.g. rtpengine -> mediasoup PlainTransport, which
+	 * speaks plain RTP not SRTP) has encrypt_func == NULL; placing
+	 * the rewrite inside the SRTP iteration loop below would skip
+	 * the plain-RTP path entirely. Applies uniformly to transcoded,
+	 * passthrough, and audio-player code paths since they all
+	 * funnel through this function as the egress chokepoint. RTCP
+	 * SSRC is left alone (mediasoup routes audio by RTP SSRC). The
+	 * (struct rtp_header *) cast strips the const from rtp_payload's
+	 * return type -- the packet buffer itself is writable, only the
+	 * pointer type is const by API contract. */
+	if (out->force_egress_ssrc) {
+		unsigned int rewrote = 0, total = 0;
+		IQUEUE_FOREACH(&mp->packets_out, p) {
+			total++;
+			str payload = STR_NULL;
+			struct rtp_header *rtp_h = (struct rtp_header *)
+				rtp_payload(&payload, &p->s, NULL);
+			if (rtp_h) {
+				rtp_h->ssrc = htonl(out->force_egress_ssrc);
+				rewrote++;
+			}
+		}
+		ilog(LOG_INFO | LOG_FLAG_LIMIT,
+			"SSRC-egress: chokepoint stream pinned=0x%08x rewrote=%u/%u packets",
+			out->force_egress_ssrc, rewrote, total);
+	}
 
 	if (!encrypt_func)
 		return 0x00;

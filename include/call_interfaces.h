@@ -130,6 +130,11 @@ struct sdp_ng_flags {
 		MEO_BKW,
 		MEO_BOTH,
 	} media_echo:3;
+	struct {
+		uint32_t egress_to_offerer;	/* 0 = unset; SSRC for packets going TO from-tag (offerer) side */
+		uint32_t egress_to_answerer;	/* 0 = unset; SSRC for packets going TO to-tag (answerer) side */
+		uint32_t ingress;		/* reserved for future use */
+	} ssrc_force;
 	enum {
 		ALL_NONE = 0,
 		ALL_ALL,
@@ -310,7 +315,12 @@ RTPE_NG_FLAGS_STR_CASE_HT_PARAMS
 		     moh_sendrecv:1,
 		     moh_reflect:1,
 		     /* prevents double MoH holds */
-		     moh_double_hold:1;
+		     moh_double_hold:1,
+		     /* opensips-edge: when set on any NG command in a call,
+		      * persists on struct call (see force_strip_extmap there)
+		      * and forces the extmap printer at egress regardless of
+		      * SDP-declared extmap state. */
+		     force_strip_extmap:1;
 };
 
 
