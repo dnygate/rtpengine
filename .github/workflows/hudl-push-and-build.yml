@@ -1,0 +1,66 @@
+name: Hudl - Build and Push rtpengine
+
+# Dedicated Hudl workflow for the feature/ssrc-force-egress branch — builds the
+# production rtpengine image FROM THIS CHECKOUT (docker/hudl.Dockerfile) and
+# pushes it to the private registry. This repo now owns the rtpengine image;
+# opensips-edge no longer builds it. Upstream sipwise workflows (unit-tests,
+# debian-package-build, ...) are untouched and keep running on their own
+# triggers.
+#
+# Image URL for c2 default_images / Nomad job specs:
+#   ${REGISTRY_DOMAIN}/rtpengine:1.0.0        (stable tag c2 pins today)
+#   ${REGISTRY_DOMAIN}/rtpengine:ssrc-force-egress
+#   ${REGISTRY_DOMAIN}/rtpengine:sha-<commit>
+
+on:
+    push:
+        branches: [feature/ssrc-force-egress]
+    workflow_dispatch:
+
+env:
+    REGISTRY: ${{ secrets.REGISTRY_DOMAIN }}
+
+jobs:
+    build-and-push:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+
+            # docker-container driver — required for the type=gha cache export
+            # (the default docker driver cannot export a build cache).
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v3
+
+            - name: Log in to custom registry
+              uses: docker/login-action@v3
+              with:
+                  registry: ${{ env.REGISTRY }}
+                  username: ${{ secrets.REGISTRY_USERNAME }}
+                  password: ${{ secrets.REGISTRY_PASSWORD }}
+
+            - name: Extract metadata (tags, labels)
+              id: meta
+              uses: docker/metadata-action@v5
+              with:
+                  images: ${{ env.REGISTRY }}/rtpengine
+                  tags: |
+                      type=sha
+                      type=raw,value=ssrc-force-egress
+                      # Stable tag the c2 default_images rows pin. The Nomad job
+                      # uses force_pull, so a redeploy always picks up the
+                      # freshest build of this tag.
+                      type=raw,value=1.0.0
+                      type=raw,value=latest
+
+            - name: Build and push rtpengine
+              uses: docker/build-push-action@v6
+              with:
+                  context: .
+                  file: docker/hudl.Dockerfile
+                  push: true
+                  tags: ${{ steps.meta.outputs.tags }}
+                  labels: ${{ steps.meta.outputs.labels }}
+                  cache-from: type=gha,scope=rtpengine-hudl
+                  cache-to: type=gha,mode=max,scope=rtpengine-hudl
