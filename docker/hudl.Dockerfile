@@ -51,7 +51,10 @@ RUN apt-get update && \
 COPY . /build/rtpengine
 
 WORKDIR /build/rtpengine
-RUN make -C daemon -j"$(nproc)" \
+# Target `rtpengine` (the binary), NOT `all`: all also wants the man page
+# (rtpengine.8), whose source lives in docs/ — which this repo's .dockerignore
+# excludes from the build context. Same approach as the upstream Dockerfile.
+RUN make -C daemon -j"$(nproc)" rtpengine \
         with_iptables_option=no \
         with_nftables_option=no \
         with_transcoding=yes
