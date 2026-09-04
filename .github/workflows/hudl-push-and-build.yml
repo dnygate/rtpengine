@@ -2,15 +2,16 @@ name: Hudl - Build and Push rtpengine
 
 # Dedicated Hudl workflow for the feature/ssrc-force-egress branch — builds the
 # production rtpengine image FROM THIS CHECKOUT (docker/hudl.Dockerfile) and
-# pushes it to the private registry. This repo now owns the rtpengine image;
+# pushes it to the GitHub Container Registry (ghcr.io), which is free for
+# public repositories. This repo now owns the rtpengine image;
 # opensips-edge no longer builds it. Upstream sipwise workflows (unit-tests,
 # debian-package-build, ...) are untouched and keep running on their own
 # triggers.
 #
 # Image URL for c2 default_images / Nomad job specs:
-#   ${REGISTRY_DOMAIN}/rtpengine:1.0.0        (stable tag c2 pins today)
-#   ${REGISTRY_DOMAIN}/rtpengine:ssrc-force-egress
-#   ${REGISTRY_DOMAIN}/rtpengine:sha-<commit>
+#   ghcr.io/dnygate/rtpengine:1.0.0        (stable tag c2 pins today)
+#   ghcr.io/dnygate/rtpengine:ssrc-force-egress
+#   ghcr.io/dnygate/rtpengine:sha-<commit>
 
 on:
     push:
@@ -18,11 +19,16 @@ on:
     workflow_dispatch:
 
 env:
-    REGISTRY: ${{ secrets.REGISTRY_DOMAIN }}
+    REGISTRY: ghcr.io
+    IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
     build-and-push:
         runs-on: ubuntu-latest
+
+        permissions:
+            contents: read
+            packages: write
 
         steps:
             - name: Checkout code
@@ -33,18 +39,18 @@ jobs:
             - name: Set up Docker Buildx
               uses: docker/setup-buildx-action@v3
 
-            - name: Log in to custom registry
+            - name: Log in to GitHub Container Registry
               uses: docker/login-action@v3
               with:
                   registry: ${{ env.REGISTRY }}
-                  username: ${{ secrets.REGISTRY_USERNAME }}
-                  password: ${{ secrets.REGISTRY_PASSWORD }}
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
 
             - name: Extract metadata (tags, labels)
               id: meta
               uses: docker/metadata-action@v5
               with:
-                  images: ${{ env.REGISTRY }}/rtpengine
+                  images: ${{ env.IMAGE }}
                   tags: |
                       type=sha
                       type=raw,value=ssrc-force-egress
