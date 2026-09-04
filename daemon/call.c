@@ -1015,65 +1015,10 @@ static void __fill_stream(struct packet_stream *ps, const struct endpoint *epp, 
 	struct endpoint ep;
 	struct call_media *media = ps->media;
 
-	/* opensips-edge force-strip-extmap: persist the flag on the
-	 * parent call object so the printer selector in media_socket.c
-	 * sees it for every leg in the call, regardless of which NG
-	 * command first set the flag. Idempotent -- multiple
-	 * __fill_stream calls just re-assert true. */
-	if (flags && flags->force_strip_extmap && media && media->call)
-		media->call->force_strip_extmap = true;
-
 	atomic64_set_na(&ps->last_packet_us, rtpe_now);
 
 	ep = *epp;
 	ep.port += port_off;
-
-	/* SSRC.egress force: SIP-semantic bidirectional. Compare this
-	 * stream's monologue tag against the NG call's from-tag to decide
-	 * which side this stream represents:
-	 *   - tag matches from-tag  --> this is the offerer-side stream;
-	 *     apply ssrc_force.egress_to_offerer (use when the SFU is the
-	 *     offerer, e.g. outbound calls SFU originated).
-	 *   - tag does NOT match    --> this is the answerer-side stream;
-	 *     apply ssrc_force.egress_to_answerer (use when the SFU is
-	 *     the answerer, e.g. inbound calls).
-	 * At offer time the answerer's monologue tag may be empty (no
-	 * answer yet); empty tag still counts as 'not from-tag' so the
-	 * answerer-side flag takes effect immediately and persists when
-	 * the answer eventually arrives. Either, both, or neither key
-	 * may be set. Packets going TO the targeted side have their RTP
-	 * SSRC rewritten at the media_packet_encrypt() chokepoint. */
-	if (flags && ps->media && ps->media->monologue) {
-		/* Identify the SIP-level offerer's tag, which we need regardless
-		 * of which NG opmode is currently being processed. rtpengine's
-		 * call_ng_process_flags swaps from_tag<->to_tag at OP_ANSWER time
-		 * (so the NG-level from-tag always means 'whoever sent the SDP
-		 * we're processing right now'). Without correcting for this swap,
-		 * the answerer's stream gets misclassified as is_offerer=true at
-		 * answer time and the wrong ssrc_force field gets consulted. */
-		const str *offerer_tag = (flags->opmode == OP_OFFER)
-			? &flags->from_tag : &flags->to_tag;
-		if (offerer_tag->len > 0) {
-			const str *mtag = &ps->media->monologue->tag;
-			bool is_offerer = (mtag->len > 0
-					&& str_cmp_str(mtag, offerer_tag) == 0);
-			uint32_t pinned = 0;
-			if (is_offerer) {
-				if (flags->ssrc_force.egress_to_offerer) {
-					ps->force_egress_ssrc = flags->ssrc_force.egress_to_offerer;
-					pinned = ps->force_egress_ssrc;
-				}
-			} else {
-				if (flags->ssrc_force.egress_to_answerer) {
-					ps->force_egress_ssrc = flags->ssrc_force.egress_to_answerer;
-					pinned = ps->force_egress_ssrc;
-				}
-			}
-			if (pinned)
-				ilog(LOG_DEBUG, "SSRC-egress: pinned %s side stream to 0x%08x (opmode=%d)",
-						is_offerer ? "offerer" : "answerer", pinned, flags->opmode);
-		}
-	}
 
 	/* if the endpoint hasn't changed, we do nothing */
 	if (PS_ISSET(ps, FILLED) && !memcmp(&ps->advertised_endpoint, &ep, sizeof(ep)))

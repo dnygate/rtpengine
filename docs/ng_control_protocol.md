@@ -1142,41 +1142,6 @@ Spaces in each string may be replaced by hyphens.
 
 	Add `a=mid` attributes to the outgoing SDP if they were not already present.
 
-* `SSRC`
-
-	Contains a dictionary controlling SSRC handling on a per-call basis. Useful
-	for integrations where a downstream system (e.g. a WebRTC SFU) needs to
-	bind its receiver to a deterministic SSRC chosen by the control plane,
-	rather than discovering the SSRC after-the-fact via RTCP or a query.
-
-	The `egress-to-offerer` key specifies an SSRC value (decimal or `0x`-prefixed
-	hex) that *rtpengine* will stamp into every outgoing RTP packet's SSRC field
-	on the leg going TO the offerer side (i.e. the party identified by the NG
-	call's `from-tag`). Use when the SFU is the offerer -- typically outbound
-	calls that the SFU originated.
-
-	The `egress-to-answerer` key specifies the SSRC for packets going TO the
-	answerer side (the party identified by `to-tag`, which may not yet exist
-	at offer time -- the empty-tag monologue qualifies as the answerer until
-	the answer arrives). Use when the SFU is the answerer -- typically inbound
-	calls from external parties.
-
-	Either, both, or neither sub-key may be set. The forced values persist for
-	the lifetime of the call.
-
-	Applies uniformly to transcoded, passthrough, and audio-player paths. The
-	rewrite happens just before SRTP encryption, so the SRTP authentication
-	tag is computed against the forced value and remains valid on the wire.
-
-	The contained key `ingress` is reserved for future use; supplying it logs
-	a warning and is otherwise a no-op in this release.
-
-	Examples in string syntax:
-	  `SSRC-egress-to-answerer=0x12345678`   (inbound: SFU is answerer)
-	  `SSRC-egress-to-offerer=0x87654321`    (outbound: SFU is offerer)
-
-	A value of `0` is treated as unset.
-
 * `inactive`
 
     Useful for `subscribe request` messages to produce an SDP which is marked
