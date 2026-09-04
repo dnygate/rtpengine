@@ -21,8 +21,7 @@
 #include "compat.h"
 #include "helpers.h"
 #include "call.h"
-#include "log.h"
-#include "log_funcs.h"
+#include "log_d.h"
 #include "str.h"
 #include "crypto.h"
 #include "dtls.h"
@@ -1558,7 +1557,7 @@ static int redis_tags(call_t *c, struct redis_list *tags, parser_arg arg) {
 	for (i = 0; i < tags->len; i++) {
 		rh = &tags->rh[i];
 
-		ml = __monologue_create(c);
+		ml = __monologue_create(c, &c->callid);
 		if (!ml)
 			return -1;
 
@@ -1566,6 +1565,8 @@ static int redis_tags(call_t *c, struct redis_list *tags, parser_arg arg) {
 			return -1;
 		if (!redis_hash_get_str(&s, rh, "tag"))
 			__monologue_tag(ml, &s);
+		if (!redis_hash_get_str(&s, rh, "call_id"))
+			ml->call_id = call_str_cpy(&s);
 		if (!redis_hash_get_str(&s, rh, "via-branch"))
 			__monologue_viabranch(ml, &s);
 		if (!redis_hash_get_str(&s, rh, "label"))
@@ -2420,14 +2421,14 @@ err:
 }
 
 #define JSON_ADD_LIST_STRING(f,...) do { \
-		int len = snprintf(tmp,sizeof(tmp), f, __VA_ARGS__); \
+		size_t len = rtpe_snprintf(tmp,sizeof(tmp), f, __VA_ARGS__); \
 		char enc[len * 3 + 1]; \
 		str encstr = parser->escape(enc, tmp, len); \
 		parser->list_add_str_dup(inner, &encstr); \
 	} while (0)
 #define JSON_SET_NSTRING(a,b,c,...) do { \
 		char tmp1[128]; \
-		int len = snprintf(tmp1, sizeof(tmp1), c, __VA_ARGS__); \
+		size_t len = rtpe_snprintf(tmp1, sizeof(tmp1), c, __VA_ARGS__); \
 		char enc[len * 3 + 1]; \
 		str encstr = parser->escape(enc, tmp1, len); \
 		char tmp2[256]; \
@@ -2444,7 +2445,7 @@ err:
 	} while (0)
 #define JSON_SET_SIMPLE(a,c,...) do { \
 		char tbuf[128]; \
-		int len = snprintf(tbuf, sizeof(tbuf), c, __VA_ARGS__); \
+		size_t len = rtpe_snprintf(tbuf, sizeof(tbuf), c, __VA_ARGS__); \
 		char enc[len * 3 + 1]; \
 		str encstr = parser->escape(enc, tbuf, len); \
 		parser->dict_add_str_dup(inner, a, &encstr); \
@@ -2640,6 +2641,8 @@ static str redis_encode_json(ng_parser_ctx_t *ctx, call_t *c, void **to_free) {
 
 				if (ml->tag.s)
 					JSON_SET_SIMPLE_STR("tag", &ml->tag);
+				if (ml->call_id.s)
+					JSON_SET_SIMPLE_STR("call_id", &ml->tag);
 				if (ml->viabranch.s)
 					JSON_SET_SIMPLE_STR("via-branch", &ml->viabranch);
 				if (ml->label.s)

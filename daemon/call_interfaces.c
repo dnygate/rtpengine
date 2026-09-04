@@ -2,20 +2,16 @@
 
 #include <stdio.h>
 #include <unistd.h>
-#include <glib.h>
 #include <stdlib.h>
 #include <pcre2.h>
 #include <inttypes.h>
 
-#include "call.h"
+#include "control_ng.h"
 #include "helpers.h"
-#include "log.h"
+#include "log_d.h"
 #include "redis.h"
-#include "sdp.h"
-#include "str.h"
 #include "control_tcp.h"
 #include "control_udp.h"
-#include "control_ng.h"
 #include "rtp.h"
 #include "ice.h"
 #include "recording.h"
@@ -28,9 +24,6 @@
 #include "media_player.h"
 #include "dtmf.h"
 #include "codec.h"
-#include "dtmf.h"
-#include "call_flags.h"
-
 
 #define call_ng_process_flags_RETURN(a, b) \
 	do { \
@@ -53,11 +46,11 @@ enum basic_errors {
 	NG_ERROR_NO_TO_TAG = 4
 };
 
-static const char* _ng_basic_errors[] = {
-    [NG_ERROR_NO_SDP_BODY] = "No SDP body in message",
-    [NG_ERROR_NO_CALL_ID] = "No call-id in message",
-    [NG_ERROR_NO_FROM_TAG] = "No from-tag in message",
-    [NG_ERROR_NO_TO_TAG] = "No to-tag in message",
+static const char* const _ng_basic_errors[] = {
+	[NG_ERROR_NO_SDP_BODY] = "No SDP body in message",
+	[NG_ERROR_NO_CALL_ID] = "No call-id in message",
+	[NG_ERROR_NO_FROM_TAG] = "No from-tag in message",
+	[NG_ERROR_NO_TO_TAG] = "No to-tag in message",
 };
 
 static void ng_stats_ssrc(const ng_parser_t *parser, parser_arg dict, parser_arg list,
@@ -76,7 +69,7 @@ static str streams_print(medias_arr *s, int start, int end, const char *prefix, 
 		g_string_append_printf(o, "%s ", prefix);
 
 	for (i = start; i <= end; i++) {
-		if (s->len <= i || (media = s->pdata[i - 1]) == NULL) {
+		if (i < 1 || i > s->len || (media = s->pdata[i - 1]) == NULL) {
 			ilog(LOG_WARNING, "Requested media index %i not found", i);
 			break;
 		}
@@ -91,7 +84,7 @@ static str streams_print(medias_arr *s, int start, int end, const char *prefix, 
 			call_stream_address(o, ps, format, NULL, true);
 
 		port = ps->selected_sfd ? ps->selected_sfd->socket.local.port : 0;
-		g_string_append_printf(o, (format == 1) ? "%i " : " %i", port);
+		g_string_append_printf(o, (format == SAF_UDP) ? "%i " : " %i", port);
 
 		if (format == SAF_UDP) {
 			af = call_stream_address(o, ps, format, NULL, true);
@@ -133,7 +126,7 @@ static int addr_parse_udp(struct stream_params *sp, char **out) {
 
 	if (out[RE_UDP_UL_FLAGS] && *out[RE_UDP_UL_FLAGS]) {
 		i = 0;
-		for (cp =out[RE_UDP_UL_FLAGS]; *cp && i < 2; cp++) {
+		for (cp = out[RE_UDP_UL_FLAGS]; *cp && i < 2; cp++) {
 			c = chrtoupper(*cp);
 			if (c == 'E')
 				sp->direction[i++] = STR("external");
@@ -187,7 +180,7 @@ static str call_update_lookup_udp(char **out, enum ng_opmode opmode, const char*
 
 	updated_created_from(c, addr);
 
-	if (call_get_mono_dialogue(monologues, c, &fromtag, &totag, NULL, NULL, NULL))
+	if (call_get_mono_dialogue(monologues, c, &callid, &fromtag, &totag, NULL, NULL, NULL))
 		goto ml_fail;
 
 	struct call_monologue *from_ml = monologues[0];
@@ -346,7 +339,7 @@ static str call_request_lookup_tcp(char **out, enum ng_opmode opmode) {
 		str_swap(&fromtag, &totag);
 	}
 
-	if (call_get_mono_dialogue(monologues, c, &fromtag, &totag, NULL, NULL, NULL)) {
+	if (call_get_mono_dialogue(monologues, c, &callid, &fromtag, &totag, NULL, NULL, NULL)) {
 		ilog(LOG_WARNING, "Invalid dialogue association");
 		goto out2;
 	}
@@ -372,7 +365,7 @@ str call_lookup_tcp(char **out) {
 }
 
 str call_delete_udp(char **out) {
-	__C_DBG("got delete for callid '%s' and viabranch '%s'",
+	dbg_int("got delete for callid '%s' and viabranch '%s'",
 		out[RE_UDP_DQ_CALLID], out[RE_UDP_DQ_VIABRANCH]);
 
 	str callid = STR(out[RE_UDP_DQ_CALLID]);
@@ -390,7 +383,7 @@ str call_query_udp(char **out) {
 	str ret;
 	struct call_stats stats;
 
-	__C_DBG("got query for callid '%s'", out[RE_UDP_DQ_CALLID]);
+	dbg_int("got query for callid '%s'", out[RE_UDP_DQ_CALLID]);
 
 	str callid = STR(out[RE_UDP_DQ_CALLID]);
 	str fromtag = STR(out[RE_UDP_DQ_FROMTAG]);
@@ -628,7 +621,7 @@ static const char *call_offer_answer_ng(ng_command_ctx_t *ctx, const char *addr)
 	call_ngb_hold_ref(call, ctx->ngbuf);
 
 	errstr = "Invalid dialogue association";
-	if (call_get_mono_dialogue(monologues, call, &flags.from_tag, &flags.to_tag,
+	if (call_get_mono_dialogue(monologues, call, &flags.call_id, &flags.from_tag, &flags.to_tag,
 			flags.via_branch.s ? &flags.via_branch : NULL, &flags,
 			streams.length ? &streams.head->data->rtp_endpoint : NULL)) {
 		goto out;
@@ -725,6 +718,12 @@ out:
 	return errstr;
 }
 
+const char *call_ping_ng(ng_command_ctx_t *ctx)
+{
+	/* consider ping as always unconditionally ok */
+	return NULL;
+}
+
 const char *call_offer_ng(ng_command_ctx_t *ctx,
 		const char *addr)
 {
@@ -752,10 +751,11 @@ const char *call_delete_ng(ng_command_ctx_t *ctx) {
 	if (rtpp_flags.discard_recording)
 		recording_discard(c);
 
-	if (call_delete_branch(c, &rtpp_flags.via_branch,
+	if (call_delete_branch(c, &rtpp_flags.call_id, &rtpp_flags.via_branch,
 				&rtpp_flags.from_tag,
 				(rtpp_flags.to_tag_flag ? &rtpp_flags.to_tag : NULL),
-				ctx, rtpp_flags.delete_delay))
+				ctx, rtpp_flags.delete_delay,
+				!rtpp_flags.fast))
 	{
 		goto err;
 	}
@@ -844,7 +844,6 @@ static void ng_stats_stream(ng_command_ctx_t *ctx, parser_arg list, const struct
 	BF_PS("DTLS fingerprint verified", FINGERPRINT_VERIFIED);
 	BF_PS("strict source address", STRICT_SOURCE);
 	BF_PS("media handover", MEDIA_HANDOVER);
-	BF_PS("ICE", ICE);
 
 stats:
 	if (totals->last_packet_us < packet_stream_last_packet(ps))
@@ -969,7 +968,7 @@ static void ng_stats_monologue(ng_command_ctx_t *ctx, parser_arg dict, const str
 	parser_arg b_subscribers = parser->dict_add_list(sub, "subscribers");
 	for (int i = 0; i < ml->medias->len; i++)
 	{
-		struct call_media * media = ml->medias->pdata[i];
+		struct call_media *media = ml->medias->pdata[i];
 		if (!media)
 			continue;
 
@@ -1094,6 +1093,9 @@ static void ng_stats_ssrc_1(const ng_parser_t *parser, parser_arg ent, struct ss
 static void ng_stats_ssrc(const ng_parser_t *parser, parser_arg dict, parser_arg list,
 		const struct ssrc_hash *ht)
 {
+	if (rtpe_config.ssrc_reporting == SRP_NONE)
+		return;
+
 	for (GList *l = ht->nq.head; l; l = l->next) {
 		struct ssrc_entry_call *se = l->data;
 		char tmp[12];
@@ -1103,7 +1105,8 @@ static void ng_stats_ssrc(const ng_parser_t *parser, parser_arg dict, parser_arg
 
 		parser->dict_add_int(ent, "SSRC", se->h.ssrc);
 
-		ng_stats_ssrc_1(parser, ent, se);
+		if ((rtpe_config.ssrc_reporting & 0x2) == 0)
+			ng_stats_ssrc_1(parser, ent, se);
 
 		if (dict.gen && !parser->dict_contains(dict, tmp)) {
 			ent = parser->dict_add_dict_dup(dict, tmp);
@@ -1142,7 +1145,9 @@ void ng_call_stats(ng_command_ctx_t *ctx, call_t *call, const str *fromtag, cons
 	if (call->metadata.s)
 		parser->dict_add_str(ctx->resp, "metadata", &call->metadata);
 
-	ssrc = parser->dict_add_dict(ctx->resp, "SSRC");
+	if ((rtpe_config.ssrc_reporting & 0x1) == 0)
+		ssrc = parser->dict_add_dict(ctx->resp, "SSRC");
+
 	tags = parser->dict_add_dict(ctx->resp, "tags");
 
 stats:
@@ -1161,7 +1166,7 @@ stats:
 			g_auto(GQueue) mls = G_QUEUE_INIT; /* to avoid duplications */
 			for (int i = 0; i < ml->medias->len; i++)
 			{
-				struct call_media * media = ml->medias->pdata[i];
+				struct call_media *media = ml->medias->pdata[i];
 				if (!media)
 					continue;
 
@@ -1696,7 +1701,7 @@ const char *call_unblock_dtmf_ng(ng_command_ctx_t *ctx) {
 
 static const char *call_block_silence_media(ng_command_ctx_t *ctx, bool on_off, const char *ucase_verb,
 		const char *lcase_verb,
-		unsigned int call_flag, unsigned int ml_flag, size_t attr_offset)
+		unsigned int call_flag, unsigned int ml_flag, size_t attr_offset, enum ng_opmode opmode)
 {
 	g_autoptr(call_t) call = NULL;
 	struct call_monologue *monologue;
@@ -1741,15 +1746,15 @@ static const char *call_block_silence_media(ng_command_ctx_t *ctx, bool on_off, 
 				}
 			}
 
-			/* now check if any sink ml media is susbcribed to any of monologue medias */
+			/* now check if any sink ml media is subscribed to any of monologue medias */
 			for (int i = 0; i < sink_ml->medias->len; i++)
 			{
-				struct call_media * sink_md = monologue->medias->pdata[i];
+				struct call_media *sink_md = sink_ml->medias->pdata[i];
 				if (!sink_md)
 					continue;
 				for (int j = 0; j < monologue->medias->len; j++)
 				{
-					struct call_media * ml_media = monologue->medias->pdata[j];
+					struct call_media *ml_media = monologue->medias->pdata[j];
 					if (!ml_media)
 						continue;
 					__auto_type ll = t_hash_table_lookup(ml_media->media_subscriptions_ht, sink_md);
@@ -1773,7 +1778,7 @@ static const char *call_block_silence_media(ng_command_ctx_t *ctx, bool on_off, 
 		{
 			for (int i = 0; i < monologue->medias->len; i++)
 			{
-				struct call_media * ml_media = monologue->medias->pdata[i];
+				struct call_media *ml_media = monologue->medias->pdata[i];
 				if (!ml_media)
 					continue;
 
@@ -1819,7 +1824,7 @@ static const char *call_block_silence_media(ng_command_ctx_t *ctx, bool on_off, 
 					return "Media flow not found (to-tag not subscribed)";
 
 			}
-			update_init_monologue_subscribers(monologue, OP_BLOCK_SILENCE_MEDIA);
+			update_init_monologue_subscribers(monologue, opmode);
 
 		} else {
 			/* it seems no to-monologue is given and no "all" flag is given as well.
@@ -1855,7 +1860,8 @@ static const char *call_block_silence_media(ng_command_ctx_t *ctx, bool on_off, 
 	call_block_silence_media(ctx, on_off, ucase_verb, lcase_verb, \
 			CALL_FLAG_ ## flag, \
 			ML_FLAG_ ## flag, \
-			G_STRUCT_OFFSET(struct sink_attrs, member_name))
+			G_STRUCT_OFFSET(struct sink_attrs, member_name), \
+			OP_ ## flag)
 
 const char *call_block_media_ng(ng_command_ctx_t *ctx) {
 	return CALL_BLOCK_SILENCE_MEDIA(ctx, true, "Blocking", "blocking", block_media, BLOCK_MEDIA);
@@ -1930,6 +1936,8 @@ const char *call_play_media_ng(ng_command_ctx_t *ctx) {
 				.db_id = flags.db_id,
 			);
 
+		ilog(LOG_DEBUG, "Requesting play media");
+
 		err = call_play_media_for_ml(monologue, opts, &flags);
 		if (err)
 			return err;
@@ -1964,6 +1972,9 @@ const char *call_stop_media_ng(ng_command_ctx_t *ctx) {
 
 		if (!monologue->player)
 			return "Not currently playing media";
+
+		if (monologue->player->opts.moh)
+			return "Currently MoH ongoing, ignore stop media.";
 
 		last_frame_pos = call_stop_media_for_ml(monologue);
 	}
@@ -2051,8 +2062,10 @@ found:
 			struct call_media *ml_media = monologue->medias->pdata[i];
 			if (!ml_media)
 				continue;
+			if (ml_media->type_id != MT_AUDIO)
+				continue;
 
-			struct call_media * ms_media_sink = NULL;
+			struct call_media *ms_media_sink = NULL;
 
 			IQUEUE_FOREACH(&ml_media->media_subscribers, ms) {
 				ms_media_sink = ms->media;
@@ -2093,8 +2106,10 @@ const char *call_publish_ng(ng_command_ctx_t *ctx, const char *addr) {
 
 	if (!flags.sdp.len)
 		return "No SDP body in message";
-	if (!flags.call_id.len)
+	if (!flags.call_id.len) {
 		flags.call_id = STR_LEN(rand_hex_str(rand_call_id, 32), 64);
+		log_info_str(&flags.call_id);
+	}
 	if (!flags.from_tag.len)
 		flags.from_tag = STR_LEN(rand_hex_str(rand_from_tag, 32), 64);
 
@@ -2112,7 +2127,7 @@ const char *call_publish_ng(ng_command_ctx_t *ctx, const char *addr) {
 		return NULL;
 
 	updated_created_from(call, addr);
-	struct call_monologue *ml = call_get_or_create_monologue(call, &flags.from_tag);
+	struct call_monologue *ml = call_get_or_create_monologue(call, &flags.call_id, &flags.from_tag);
 
 	ret = monologue_publish(ml, &streams, &flags);
 	if (ret)
@@ -2182,7 +2197,7 @@ const char *call_subscribe_request_ng(ng_command_ctx_t *ctx) {
 
 	g_autoptr(call_t) call = t_queue_pop_head(&calls);
 
-	struct call_monologue *dest_ml = call_get_or_create_monologue(call, &flags.to_tag);
+	struct call_monologue *dest_ml = call_get_or_create_monologue(call, &flags.call_id, &flags.to_tag);
 
 	int ret = monologue_subscribe_request(&mq, dest_ml, &flags);
 	if (ret)
@@ -2280,6 +2295,9 @@ const char *call_subscribe_answer_ng(ng_command_ctx_t *ctx) {
 	if (!call)
 		return "Unknown call-ID";
 
+	if (!flags.sdp.len)
+		return "No SDP body in message";
+
 	if (!sdp_parse(&flags.sdp, &parsed, &flags))
 		return "Failed to parse SDP";
 
@@ -2291,8 +2309,6 @@ const char *call_subscribe_answer_ng(ng_command_ctx_t *ctx) {
 
 	if (!flags.to_tag.s)
 		return "No to-tag in message";
-	if (!flags.sdp.len)
-		return "No SDP body in message";
 
 	// get destination monologue
 	struct call_monologue *dest_ml = call_get_monologue(call, &flags.to_tag);
@@ -2420,7 +2436,7 @@ const char *call_connect_ng(ng_command_ctx_t *ctx) {
 	if (!call)
 		return "Failed to merge two calls into one (tag collision)";
 
-	struct call_monologue *dest_ml = call_get_or_create_monologue(call, &flags.to_tag);
+	struct call_monologue *dest_ml = call_get_or_create_monologue(call, &flags.call_id, &flags.to_tag);
 	if (!dest_ml)
 		return "To-tag not found";
 
@@ -2486,7 +2502,7 @@ const char *call_transform_ng(ng_command_ctx_t *ctx) {
 		flags.from_tag = STR_LEN(rand_hex_str(rand_from_tag, 32), 64);
 
 	call = call_get_or_create(&flags.call_id, false);
-	struct call_monologue *ml = call_get_or_create_monologue(call, &flags.from_tag);
+	struct call_monologue *ml = call_get_or_create_monologue(call, &flags.call_id, &flags.from_tag);
 
 	g_auto(medias_q) mq = TYPED_GQUEUE_INIT;
 	if (!monologue_transform(ml, &flags, &mq))
@@ -2502,8 +2518,14 @@ const char *call_transform_ng(ng_command_ctx_t *ctx) {
 		__auto_type m = l->data;
 		parser_arg dict = parser->list_add_dict(list);
 		parser->dict_add_str_dup(dict, "id", &m->media_id);
+		if (!m->streams.head)
+			continue;
 		__auto_type ps = m->streams.head->data;
+		if (!ps->selected_sfd)
+			continue;
 		__auto_type sfd = ps->selected_sfd;
+		if (!sfd->socket.local.address.family)
+			continue;
 		parser->dict_add_str(dict, "family", STR_PTR(sfd->socket.local.address.family->rfc_name));
 		parser->dict_add_str_dup(dict, "address", STR_PTR(sockaddr_print_buf(&sfd->socket.local.address)));
 		parser->dict_add_int(dict, "port", sfd->socket.local.port);
@@ -2522,13 +2544,15 @@ const char *call_create_ng(ng_command_ctx_t *ctx) {
 
 	call_ng_process_flags_RETURN(&flags, ctx);
 
-	if (!flags.call_id.len)
+	if (!flags.call_id.len) {
 		flags.call_id = STR_LEN(rand_hex_str(rand_call_id, 32), 64);
+		log_info_str(&flags.call_id);
+	}
 	if (!flags.from_tag.len)
 		flags.from_tag = STR_LEN(rand_hex_str(rand_from_tag, 32), 64);
 
 	call = call_get_or_create(&flags.call_id, false);
-	struct call_monologue *ml = call_get_or_create_monologue(call, &flags.from_tag);
+	struct call_monologue *ml = call_get_or_create_monologue(call, &flags.call_id, &flags.from_tag);
 	if (!monologue_call_create(ml, &flags))
 		return "failed to set up call/monologue";
 
@@ -2662,7 +2686,7 @@ void call_interfaces_free(void) {
 
 	if (streams_re) {
 		pcre2_code_free(streams_re);
-		streams_re= NULL;
+		streams_re = NULL;
 	}
 
 	t_hash_table_destroy(rtpe_signalling_templates);
@@ -2705,8 +2729,11 @@ int call_interfaces_init(charp_ht templates) {
 
 	streams_re = pcre2_compile((PCRE2_SPTR8) "^([\\d.]+):(\\d+)(?::(.*?))?(?:$|,)", PCRE2_ZERO_TERMINATED,
 			PCRE2_DOLLAR_ENDONLY | PCRE2_DOTALL, &errcode, &erroff, NULL);
-	if (!streams_re)
+	if (!streams_re) {
+		pcre2_code_free(info_re);
+		info_re = NULL;
 		return -1;
+	}
 
 	rtpe_signalling_templates = str_case_value_ht_new();
 	parse_templates(templates);

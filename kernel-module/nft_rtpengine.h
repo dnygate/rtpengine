@@ -22,6 +22,8 @@ struct xt_rtpengine_info {
 enum rtpengine_nft_attributes {
 	RTPEA_RTPENGINE_UNSPEC,
 	RTPEA_RTPENGINE_TABLE,
+	RTPEA_RTPENGINE_CREAT,
+	RTPEA_RTPENGINE_EXCL,
 	__RTPEA_RTPENGINE_MAX
 };
 #define RTPEA_RTPENGINE_MAX		(__RTPEA_RTPENGINE_MAX - 1)
@@ -116,7 +118,7 @@ struct rtpengine_target_info {
 	struct rtpengine_srtp		decrypt;
 	uint32_t			ssrc[RTPE_NUM_SSRC_TRACKING]; // Expose the SSRC to userspace when we resync.
 	struct ssrc_stats		*ssrc_stats[RTPE_NUM_SSRC_TRACKING]; // pinned memory
-	unsigned int			ssrc_media_idx[RTPE_NUM_PAYLOAD_TYPES]; // same idx as ssrc
+	unsigned int			ssrc_media_idx[RTPE_NUM_SSRC_TRACKING]; // same idx as ssrc
 
 	struct rtp_stats		*pt_stats[RTPE_NUM_PAYLOAD_TYPES]; // must be sorted by PT, pinned memory
 	unsigned int			pt_media_idx[RTPE_NUM_PAYLOAD_TYPES]; // same idx as pt_stats
@@ -213,7 +215,7 @@ enum rtpengine_command {
 	REMG_ADD_CALL,
 	REMG_DEL_CALL,
 	REMG_ADD_STREAM,
-	REMG_DEL_STREAM,
+	__REMG_UNSUED_1, // REMG_DEL_STREAM,
 	REMG_PACKET,
 	REMG_DEL_TARGET,
 	REMG_INIT_PLAY_STREAMS,

@@ -337,24 +337,6 @@ Optionally included keys are:
 
 		Reverts the `passive` setting. Only useful if the `dtls-passive` config option is set.
 
-* `DTLS-reverse`
-
-	Contains a string and influences the behaviour of DTLS-SRTP. Unlike the regular `DTLS` flag, this one
-	is used to control behaviour towards DTLS that was offered to *rtpengine*. In particular, if `passive`
-	mode is used, it prevents *rtpengine* from prematurely sending active DTLS connection attempts.
-	Possible values are:
-
-	- `passive`
-
-		Instructs *rtpengine* to prefer the passive (i.e. server) role for the DTLS
-		handshake. The default is to take the active (client) role if possible. This is useful in cases
-		where the SRTP endpoint isn't able to receive or process the DTLS handshake packets, for example
-		when it's behind NAT or needs to finish ICE processing first.
-
-	- `active`
-
-		Reverts the `passive` setting. Only useful if the `dtls-passive` config option is set.
-
 * `DTLS-fingerprint`
 
 	Contains a string and is used to select the hashing function to generate the DTLS fingerprint
@@ -438,11 +420,13 @@ Optionally included keys are:
 	received RTCP packets will not simply be passed through as usual, but
 	instead will be consumed, and instead *rtpengine* will generate its own
 	RTCP packets to send to the RTP peers. This flag will be effective for
-	both sides of a call.
+	both sides of a call. If Homer is configured, the generated RTCP reports
+    are also sent to Homer (even when no original RTCP was received).
 
 * `ICE`
 
-	Contains a string which must be one of the following values:
+    Contains a list of strings, or alternatively a single string, each of which
+    must be one of the following values:
 
 	With `remove`, any ICE attributes are stripped from the SDP body. Also
 	see the flag `reject ICE` to effect an early removal of ICE support
@@ -464,7 +448,17 @@ Optionally included keys are:
 	low-priority candidate. This used to be the default behaviour in previous versions of
 	*rtpengine*.
 
+    Adding `trickle` to the list of strings is identical to using the `trickle
+    ICE` flag described below.
+
 	The default behaviour (no `ICE` key present at all) is the same as `default`.
+
+    To influence behaviour related to ICE-lite, flags can be included in this
+    list here instead of using the separate `ICE-lite=` option. For example,
+    instead of using `ICE-lite=both`, the flag `lite-both` can be included in
+    this list.
+
+    Adding `ice2` to the list will advertise support for ICE2 in an outgoing offer.
 
 	This flag operates independently of the `replace` flags.
 
@@ -816,6 +810,31 @@ Optionally included keys are:
         DTLS. With this option set, in this scenario SDES would be preferred
         and accepted, while DTLS would be rejected. Useful in combination with
         `DTLS=off`.
+
+* `SSRC`
+
+	Contains a dictionary to control SSRC handling. The contained keys
+	`egress-to-offerer` and `egress-to-answerer` each take an SSRC value,
+	given either as an integer or as a decimal or `0x`-prefixed hexadecimal
+	string. *rtpengine* then rewrites the SSRC of every RTP packet it sends
+	towards the offerer (the party that sent the offer) or towards the
+	answerer (the party that answered it), respectively, to the given
+	value.
+
+	This is useful when a downstream system, such as a WebRTC selective
+	forwarding unit (SFU), must bind a receiver to an SSRC chosen by the
+	controlling application rather than discover it from the media itself.
+
+	Either or both keys may be given, in an `offer` as well as in an
+	`answer`. The setting persists for the lifetime of the call. The
+	rewrite applies to all outgoing RTP, regardless of whether the media is
+	being transcoded or passed through, and takes place before SRTP
+	encryption. RTCP is not rewritten. A value of `0` is ignored.
+
+	Media sent towards a party with a forced SSRC is always forwarded in
+	userspace and is excluded from kernel packet forwarding.
+
+	Example in string syntax: `SSRC=[egress-to-answerer=0x12345678]`
 
 * `supports`
 
@@ -1850,6 +1869,12 @@ of zero or more strings. The following flags are defined:
 	(such as unknown call-ID) shall
 	result in an error reply (i.e. `"result": "error"`). The default is to reply with a warning only
 	(i.e. `"result": "ok", "warning": ...`).
+
+* `fast`
+
+    Omit adding statistics to the response message. This makes processing of
+    the delete message more light-weight and produces a smaller response
+    message, which is beneficial if the statistics aren't needed.
 
 * `to-tag`
 

@@ -43,53 +43,587 @@ my ($sock_a, $sock_b, $sock_c, $sock_d, $port_a, $port_b, $ssrc, $ssrc_b, $resp,
 
 
 
-
-sub stun_req {
-	my ($controlling, $pref, $comp, $my_ufrag, $other_ufrag, $other_pwd, $use) = @_;
-
-	my $tid = NGCP::Rtpclient::ICE::random_string(12);
-
-	my @attrs;
-	unshift(@attrs, NGCP::Rtpclient::ICE::attr(0x8022, 'perltester'));
-
-	unshift(@attrs, NGCP::Rtpclient::ICE::attr($controlling ? 0x802a : 0x8029, NGCP::Rtpclient::ICE::random_string(8)));
-
-	unshift(@attrs, NGCP::Rtpclient::ICE::attr(0x0024, pack('N', NGCP::Rtpclient::ICE::calc_priority('prflx',
-				$pref, $comp))));
-	unshift(@attrs, NGCP::Rtpclient::ICE::attr(0x0006, "$other_ufrag:$my_ufrag"));
-
-	if ($use) {
-		unshift(@attrs, NGCP::Rtpclient::ICE::attr(0x0025, ''));
-	}
-
-	NGCP::Rtpclient::ICE::integrity(\@attrs, 1, $tid, $other_pwd);
-	NGCP::Rtpclient::ICE::fingerprint(\@attrs, 1, $tid);
-
-	my $packet = join('', @attrs);
-	$packet = pack('nnNa12', 1, length($packet), 0x2112A442, $tid) . $packet;
-
-	return ($packet, $tid);
-}
-
-sub stun_succ {
-	my ($port, $tid, $my_pwd) = @_;
-	my $sw = NGCP::Rtpclient::ICE::attr(0x8022, 'perltester');
-	my $xor_addr = NGCP::Rtpclient::ICE::attr(0x0020, pack('nna4', 1, $port ^ 0x2112, pack('CCCC', 203,0,113,1) ^ "\x21\x12\xa4\x42"));
-	my $attrs = [$sw, $xor_addr];
-	NGCP::Rtpclient::ICE::integrity($attrs, 257, $tid, $my_pwd);
-	NGCP::Rtpclient::ICE::fingerprint($attrs, 257, $tid);
-	my $pack = join('', @{$attrs});
-	my $packet = pack('nnNa12', 257, length($pack), 0x2112A442, $tid) . $pack;
-	#print(unpack('H*', $packet)."\n");
-	return $packet;
-};
-
-
-
-
-
-
 if ($extended_tests) {
+
+($sock_a, $sock_ax, $sock_b, $sock_bx, $sock_c, $sock_cx) = new_call(
+	[qw(198.51.100.36 4000)], [qw(198.51.100.36 4001)],
+	[qw(198.51.100.37 5000)], [qw(198.51.100.37 5001)],
+	[qw(198.51.100.38 6000)], [qw(198.51.100.38 6001)],
+);
+
+($port_a, $port_ax) = offer('ICE + delayed endpoint learning', { ICE => 'remove' }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.4
+s=tester
+c=IN IP4 198.51.100.36
+t=0 0
+a=sendrecv
+m=audio 4000 RTP/AVP 0
+a=ice-pwd:bd5e8b8d6dd8e1bc6
+a=ice-ufrag:q2758e93
+a=candidate:aaa 1 UDP 2130706431 198.51.100.36 4000 typ host
+a=candidate:aaa 2 UDP 2130706430 198.51.100.36 4001 typ host
+a=candidate:bbb 1 UDP 2130706175 198.51.100.37 5000 typ host
+a=candidate:bbb 2 UDP 2130706174 198.51.100.37 5001 typ host
+--------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.4
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+(undef, undef, $ufrag_a, $pwd_a) = answer('ICE + delayed endpoint learning', { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.4
+s=tester
+c=IN IP4 198.51.100.38
+t=0 0
+a=sendrecv
+m=audio 6000 RTP/AVP 0
+--------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.4
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+a=ice-ufrag:ICEUFRAG
+a=ice-pwd:ICEPWD
+a=candidate:ICEBASE 1 UDP 2130706431 203.0.113.1 PORT typ host
+a=candidate:ICEBASE 1 UDP 2130706175 2001:db8:4321::1 PORT typ host
+a=candidate:ICEBASE 2 UDP 2130706430 203.0.113.1 PORT typ host
+a=candidate:ICEBASE 2 UDP 2130706174 2001:db8:4321::1 PORT typ host
+SDP
+
+# consume initial STUN checks, but don't respond
+($port_c) = rcv($sock_a, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42/s);
+($port_b) = rcv($sock_b, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42/s);
+is($port_b, $port_c, "same source port");
+$port_bx = $port_b + 1;
+
+# RTP plain -> ICE ok
+snd($sock_c, $port_a,  rtp(8, 3000, 5000, 0x1a04, "\x88" x 160));
+rcv($sock_a, $port_c, rtpm(8, 3000, 5000, 0x1a04, "\x88" x 160));
+
+# RTP ICE -> plain from/to alternative port
+snd($sock_b, $port_c,  rtp(8, 1000, 3000, 0x1234, "\x99" x 160));
+# dropped because ICE not authenticated yet
+rcv_no($sock_c);
+
+
+# respond to next STUN check
+@ret1 = rcv($sock_a, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine.*?\x00\x06\x00\x11q2758e93:(........)\x00\x00\x00\x80\x29\x00\x08........\x00\x24\x00\x04\x6e\xff\xff\xff\x00\x08\x00\x14....................\x80\x28\x00\x04....$/s);
+@ret2 = rcv($sock_b, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine.*?\x00\x06\x00\x11q2758e93:(........)\x00\x00\x00\x80\x29\x00\x08........\x00\x24\x00\x04\x6e\xff\xff\xff\x00\x08\x00\x14....................\x80\x28\x00\x04....$/s);
+
+snd($sock_a, $port_b, NGCP::Rtpclient::ICE::stun_succ($ret1[0], $ret1[2], 'bd5e8b8d6dd8e1bc6'));
+snd($sock_b, $port_b, NGCP::Rtpclient::ICE::stun_succ($ret2[0], $ret2[2], 'bd5e8b8d6dd8e1bc6'));
+
+# respond to STUN on RTCP
+
+@ret1 = rcv($sock_ax, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine.*?\x00\x06\x00\x11q2758e93:(........)\x00\x00\x00\x80\x29\x00\x08........\x00\x24\x00\x04\x6e\xff\xff\xfe\x00\x08\x00\x14....................\x80\x28\x00\x04....$/s);
+@ret2 = rcv($sock_bx, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine.*?\x00\x06\x00\x11q2758e93:(........)\x00\x00\x00\x80\x29\x00\x08........\x00\x24\x00\x04\x6e\xff\xff\xfe\x00\x08\x00\x14....................\x80\x28\x00\x04....$/s);
+
+snd($sock_ax, $port_bx, NGCP::Rtpclient::ICE::stun_succ($ret1[0], $ret1[2], 'bd5e8b8d6dd8e1bc6'));
+snd($sock_bx, $port_bx, NGCP::Rtpclient::ICE::stun_succ($ret2[0], $ret2[2], 'bd5e8b8d6dd8e1bc6'));
+
+# both ICE candidates now authenticated, best candidate 'aaa'
+
+# RTP plain -> ICE ok
+snd($sock_c, $port_a,  rtp(8, 3001, 5160, 0x1a04, "\x88" x 160));
+rcv($sock_a, $port_c, rtpm(8, 3001, 5160, 0x1a04, "\x88" x 160));
+
+# RTP ICE -> plain from/to alternative port now ok
+snd($sock_b, $port_c,  rtp(8, 1001, 3160, 0x1234, "\x99" x 160));
+rcv($sock_c, $port_a, rtpm(8, 1001, 3160, 0x1234, "\x99" x 160));
+
+# RTP plain -> ICE ok, still on primary port
+snd($sock_c, $port_a,  rtp(8, 3002, 5320, 0x1a04, "\x88" x 160));
+rcv($sock_a, $port_c, rtpm(8, 3002, 5320, 0x1a04, "\x88" x 160));
+
+# send own check, nominating alternative port
+($packet, $tid) = NGCP::Rtpclient::ICE::stun_req(1, 65534, 1, 'q2758e93', $ufrag_a, $pwd_a, 1);
+snd($sock_b, $port_b, $packet);
+rcv($sock_b, -1, qr/^\x01\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine/s);
+
+($packet, $tid) = NGCP::Rtpclient::ICE::stun_req(1, 65534, 2, 'q2758e93', $ufrag_a, $pwd_a, 1);
+snd($sock_bx, $port_bx, $packet);
+rcv($sock_bx, -1, qr/^\x01\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine/s);
+
+# ICE completed, alternate port nominated
+
+# RTP plain -> ICE ok now on alternate port
+snd($sock_c, $port_a,  rtp(8, 3003, 5480, 0x1a04, "\x88" x 160));
+rcv($sock_b, $port_c, rtpm(8, 3003, 5480, 0x1a04, "\x88" x 160));
+
+# RTP ICE -> plain from/to alternative port
+snd($sock_b, $port_c,  rtp(8, 1002, 3320, 0x1234, "\x99" x 160));
+rcv($sock_c, $port_a, rtpm(8, 1002, 3320, 0x1234, "\x99" x 160));
+
+# RTP plain -> ICE ok on alternate port
+snd($sock_c, $port_a,  rtp(8, 3004, 5640, 0x1a04, "\x88" x 160));
+rcv($sock_b, $port_c, rtpm(8, 3004, 5640, 0x1a04, "\x88" x 160));
+
+# RTP ICE -> plain, silently switch to primary port
+snd($sock_a, $port_c,  rtp(8, 1003, 3480, 0x1234, "\x99" x 160));
+rcv($sock_c, $port_a, rtpm(8, 1003, 3480, 0x1234, "\x99" x 160));
+
+# RTP plain -> ICE still on alternate port
+snd($sock_c, $port_a,  rtp(8, 3005, 5800, 0x1a04, "\x88" x 160));
+rcv($sock_b, $port_c, rtpm(8, 3005, 5800, 0x1a04, "\x88" x 160));
+
+Time::HiRes::usleep(3100000); # wait out delay
+
+# RTP ICE -> plain, still on primary port
+snd($sock_a, $port_c,  rtp(8, 1004, 3640, 0x1234, "\x99" x 160));
+rcv($sock_c, $port_a, rtpm(8, 1004, 3640, 0x1234, "\x99" x 160));
+
+# RTP plain -> ICE still now on primary port
+snd($sock_c, $port_a,  rtp(8, 3006, 5960, 0x1a04, "\x88" x 160));
+rcv($sock_a, $port_c, rtpm(8, 3006, 5960, 0x1a04, "\x88" x 160));
+
+
+
+
+($sock_a, $sock_ax, $sock_b, $sock_bx, $sock_c, $sock_cx) = new_call(
+	[qw(198.51.100.36 4020)], [qw(198.51.100.36 4021)],
+	[qw(198.51.100.37 5020)], [qw(198.51.100.37 5021)],
+	[qw(198.51.100.38 6020)], [qw(198.51.100.38 6021)],
+);
+
+($port_a, $port_ax) = offer('ICE + heuristic endpoint learning', { ICE => 'remove', 'endpoint-learning' => 'heuristic' }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.4
+s=tester
+c=IN IP4 198.51.100.36
+t=0 0
+a=sendrecv
+m=audio 4020 RTP/AVP 0
+a=ice-pwd:bd5e8b8d6dd8e1bc6
+a=ice-ufrag:q2758e93
+a=candidate:aaa 1 UDP 2130706431 198.51.100.36 4020 typ host
+a=candidate:aaa 2 UDP 2130706430 198.51.100.36 4021 typ host
+a=candidate:bbb 1 UDP 2130706175 198.51.100.37 5020 typ host
+a=candidate:bbb 2 UDP 2130706174 198.51.100.37 5021 typ host
+--------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.4
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+(undef, undef, $ufrag_a, $pwd_a) = answer('ICE + heuristic endpoint learning', { 'endpoint-learning' => 'heuristic' }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.4
+s=tester
+c=IN IP4 198.51.100.38
+t=0 0
+a=sendrecv
+m=audio 6020 RTP/AVP 0
+--------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.4
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+a=ice-ufrag:ICEUFRAG
+a=ice-pwd:ICEPWD
+a=candidate:ICEBASE 1 UDP 2130706431 203.0.113.1 PORT typ host
+a=candidate:ICEBASE 1 UDP 2130706175 2001:db8:4321::1 PORT typ host
+a=candidate:ICEBASE 2 UDP 2130706430 203.0.113.1 PORT typ host
+a=candidate:ICEBASE 2 UDP 2130706174 2001:db8:4321::1 PORT typ host
+SDP
+
+# consume initial STUN checks, but don't respond
+($port_c) = rcv($sock_a, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42/s);
+($port_b) = rcv($sock_b, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42/s);
+is($port_b, $port_c, "same source port");
+$port_bx = $port_b + 1;
+
+# RTP plain -> ICE ok
+snd($sock_c, $port_a,  rtp(8, 3000, 5000, 0x1a04, "\x88" x 160));
+rcv($sock_a, $port_c, rtpm(8, 3000, 5000, 0x1a04, "\x88" x 160));
+
+# RTP ICE -> plain from/to alternative port
+snd($sock_b, $port_c,  rtp(8, 1000, 3000, 0x1234, "\x99" x 160));
+# dropped because ICE not authenticated yet
+rcv_no($sock_c);
+
+
+# respond to next STUN check
+@ret1 = rcv($sock_a, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine.*?\x00\x06\x00\x11q2758e93:(........)\x00\x00\x00\x80\x29\x00\x08........\x00\x24\x00\x04\x6e\xff\xff\xff\x00\x08\x00\x14....................\x80\x28\x00\x04....$/s);
+@ret2 = rcv($sock_b, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine.*?\x00\x06\x00\x11q2758e93:(........)\x00\x00\x00\x80\x29\x00\x08........\x00\x24\x00\x04\x6e\xff\xff\xff\x00\x08\x00\x14....................\x80\x28\x00\x04....$/s);
+
+snd($sock_a, $port_b, NGCP::Rtpclient::ICE::stun_succ($ret1[0], $ret1[2], 'bd5e8b8d6dd8e1bc6'));
+snd($sock_b, $port_b, NGCP::Rtpclient::ICE::stun_succ($ret2[0], $ret2[2], 'bd5e8b8d6dd8e1bc6'));
+
+# respond to STUN on RTCP
+
+@ret1 = rcv($sock_ax, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine.*?\x00\x06\x00\x11q2758e93:(........)\x00\x00\x00\x80\x29\x00\x08........\x00\x24\x00\x04\x6e\xff\xff\xfe\x00\x08\x00\x14....................\x80\x28\x00\x04....$/s);
+@ret2 = rcv($sock_bx, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine.*?\x00\x06\x00\x11q2758e93:(........)\x00\x00\x00\x80\x29\x00\x08........\x00\x24\x00\x04\x6e\xff\xff\xfe\x00\x08\x00\x14....................\x80\x28\x00\x04....$/s);
+
+snd($sock_ax, $port_bx, NGCP::Rtpclient::ICE::stun_succ($ret1[0], $ret1[2], 'bd5e8b8d6dd8e1bc6'));
+snd($sock_bx, $port_bx, NGCP::Rtpclient::ICE::stun_succ($ret2[0], $ret2[2], 'bd5e8b8d6dd8e1bc6'));
+
+# both ICE candidates now authenticated, best candidate 'aaa'
+
+# RTP plain -> ICE ok
+snd($sock_c, $port_a,  rtp(8, 3001, 5160, 0x1a04, "\x88" x 160));
+rcv($sock_a, $port_c, rtpm(8, 3001, 5160, 0x1a04, "\x88" x 160));
+
+# RTP ICE -> plain from/to alternative port now ok
+snd($sock_b, $port_c,  rtp(8, 1001, 3160, 0x1234, "\x99" x 160));
+rcv($sock_c, $port_a, rtpm(8, 1001, 3160, 0x1234, "\x99" x 160));
+
+# RTP plain -> ICE ok, still on primary port
+snd($sock_c, $port_a,  rtp(8, 3002, 5320, 0x1a04, "\x88" x 160));
+rcv($sock_a, $port_c, rtpm(8, 3002, 5320, 0x1a04, "\x88" x 160));
+
+# send own check, nominating alternative port
+($packet, $tid) = NGCP::Rtpclient::ICE::stun_req(1, 65534, 1, 'q2758e93', $ufrag_a, $pwd_a, 1);
+snd($sock_b, $port_b, $packet);
+rcv($sock_b, -1, qr/^\x01\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine/s);
+
+($packet, $tid) = NGCP::Rtpclient::ICE::stun_req(1, 65534, 2, 'q2758e93', $ufrag_a, $pwd_a, 1);
+snd($sock_bx, $port_bx, $packet);
+rcv($sock_bx, -1, qr/^\x01\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine/s);
+
+# ICE completed, alternate port nominated
+
+# RTP plain -> ICE ok now on alternate port
+snd($sock_c, $port_a,  rtp(8, 3003, 5480, 0x1a04, "\x88" x 160));
+rcv($sock_b, $port_c, rtpm(8, 3003, 5480, 0x1a04, "\x88" x 160));
+
+# RTP ICE -> plain from/to alternative port
+snd($sock_b, $port_c,  rtp(8, 1002, 3320, 0x1234, "\x99" x 160));
+rcv($sock_c, $port_a, rtpm(8, 1002, 3320, 0x1234, "\x99" x 160));
+
+# RTP plain -> ICE ok on alternate port
+snd($sock_c, $port_a,  rtp(8, 3004, 5640, 0x1a04, "\x88" x 160));
+rcv($sock_b, $port_c, rtpm(8, 3004, 5640, 0x1a04, "\x88" x 160));
+
+# RTP ICE -> plain, silently switch to primary port
+snd($sock_a, $port_c,  rtp(8, 1003, 3480, 0x1234, "\x99" x 160));
+rcv($sock_c, $port_a, rtpm(8, 1003, 3480, 0x1234, "\x99" x 160));
+
+# RTP plain -> ICE still on alternate port
+snd($sock_c, $port_a,  rtp(8, 3005, 5800, 0x1a04, "\x88" x 160));
+rcv($sock_b, $port_c, rtpm(8, 3005, 5800, 0x1a04, "\x88" x 160));
+
+Time::HiRes::usleep(3100000); # wait out delay
+
+# RTP ICE -> plain, still on primary port
+snd($sock_a, $port_c,  rtp(8, 1004, 3640, 0x1234, "\x99" x 160));
+rcv($sock_c, $port_a, rtpm(8, 1004, 3640, 0x1234, "\x99" x 160));
+
+# RTP plain -> ICE still now on primary port
+snd($sock_c, $port_a,  rtp(8, 3006, 5960, 0x1a04, "\x88" x 160));
+rcv($sock_a, $port_c, rtpm(8, 3006, 5960, 0x1a04, "\x88" x 160));
+
+
+
+
+($sock_a, $sock_ax, $sock_b, $sock_bx, $sock_c, $sock_cx) = new_call(
+	[qw(198.51.100.36 4040)], [qw(198.51.100.36 4041)],
+	[qw(198.51.100.37 5040)], [qw(198.51.100.37 5041)],
+	[qw(198.51.100.38 6040)], [qw(198.51.100.38 6041)],
+);
+
+($port_a, $port_ax) = offer('ICE + immediate endpoint learning', { ICE => 'remove', 'endpoint-learning' => 'immediate' }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.4
+s=tester
+c=IN IP4 198.51.100.36
+t=0 0
+a=sendrecv
+m=audio 4040 RTP/AVP 0
+a=ice-pwd:bd5e8b8d6dd8e1bc6
+a=ice-ufrag:q2758e93
+a=candidate:aaa 1 UDP 2130706431 198.51.100.36 4040 typ host
+a=candidate:aaa 2 UDP 2130706430 198.51.100.36 4041 typ host
+a=candidate:bbb 1 UDP 2130706175 198.51.100.37 5040 typ host
+a=candidate:bbb 2 UDP 2130706174 198.51.100.37 5041 typ host
+--------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.4
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+(undef, undef, $ufrag_a, $pwd_a) = answer('ICE + immediate endpoint learning', { 'endpoint-learning' => 'immediate' }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.4
+s=tester
+c=IN IP4 198.51.100.38
+t=0 0
+a=sendrecv
+m=audio 6040 RTP/AVP 0
+--------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.4
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+a=ice-ufrag:ICEUFRAG
+a=ice-pwd:ICEPWD
+a=candidate:ICEBASE 1 UDP 2130706431 203.0.113.1 PORT typ host
+a=candidate:ICEBASE 1 UDP 2130706175 2001:db8:4321::1 PORT typ host
+a=candidate:ICEBASE 2 UDP 2130706430 203.0.113.1 PORT typ host
+a=candidate:ICEBASE 2 UDP 2130706174 2001:db8:4321::1 PORT typ host
+SDP
+
+# consume initial STUN checks, but don't respond
+($port_c) = rcv($sock_a, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42/s);
+($port_b) = rcv($sock_b, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42/s);
+is($port_b, $port_c, "same source port");
+$port_bx = $port_b + 1;
+
+# RTP plain -> ICE ok
+snd($sock_c, $port_a,  rtp(8, 3000, 5000, 0x1a04, "\x88" x 160));
+rcv($sock_a, $port_c, rtpm(8, 3000, 5000, 0x1a04, "\x88" x 160));
+
+# RTP ICE -> plain from/to alternative port
+snd($sock_b, $port_c,  rtp(8, 1000, 3000, 0x1234, "\x99" x 160));
+# dropped because ICE not authenticated yet
+rcv_no($sock_c);
+
+
+# respond to next STUN check
+@ret1 = rcv($sock_a, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine.*?\x00\x06\x00\x11q2758e93:(........)\x00\x00\x00\x80\x29\x00\x08........\x00\x24\x00\x04\x6e\xff\xff\xff\x00\x08\x00\x14....................\x80\x28\x00\x04....$/s);
+@ret2 = rcv($sock_b, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine.*?\x00\x06\x00\x11q2758e93:(........)\x00\x00\x00\x80\x29\x00\x08........\x00\x24\x00\x04\x6e\xff\xff\xff\x00\x08\x00\x14....................\x80\x28\x00\x04....$/s);
+
+snd($sock_a, $port_b, NGCP::Rtpclient::ICE::stun_succ($ret1[0], $ret1[2], 'bd5e8b8d6dd8e1bc6'));
+snd($sock_b, $port_b, NGCP::Rtpclient::ICE::stun_succ($ret2[0], $ret2[2], 'bd5e8b8d6dd8e1bc6'));
+
+# respond to STUN on RTCP
+
+@ret1 = rcv($sock_ax, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine.*?\x00\x06\x00\x11q2758e93:(........)\x00\x00\x00\x80\x29\x00\x08........\x00\x24\x00\x04\x6e\xff\xff\xfe\x00\x08\x00\x14....................\x80\x28\x00\x04....$/s);
+@ret2 = rcv($sock_bx, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine.*?\x00\x06\x00\x11q2758e93:(........)\x00\x00\x00\x80\x29\x00\x08........\x00\x24\x00\x04\x6e\xff\xff\xfe\x00\x08\x00\x14....................\x80\x28\x00\x04....$/s);
+
+snd($sock_ax, $port_bx, NGCP::Rtpclient::ICE::stun_succ($ret1[0], $ret1[2], 'bd5e8b8d6dd8e1bc6'));
+snd($sock_bx, $port_bx, NGCP::Rtpclient::ICE::stun_succ($ret2[0], $ret2[2], 'bd5e8b8d6dd8e1bc6'));
+
+# both ICE candidates now authenticated, best candidate 'aaa'
+
+# RTP plain -> ICE ok
+snd($sock_c, $port_a,  rtp(8, 3001, 5160, 0x1a04, "\x88" x 160));
+rcv($sock_a, $port_c, rtpm(8, 3001, 5160, 0x1a04, "\x88" x 160));
+
+# RTP ICE -> plain from/to alternative port now ok
+snd($sock_b, $port_c,  rtp(8, 1001, 3160, 0x1234, "\x99" x 160));
+rcv($sock_c, $port_a, rtpm(8, 1001, 3160, 0x1234, "\x99" x 160));
+
+# RTP plain -> ICE ok, still on primary port
+snd($sock_c, $port_a,  rtp(8, 3002, 5320, 0x1a04, "\x88" x 160));
+rcv($sock_a, $port_c, rtpm(8, 3002, 5320, 0x1a04, "\x88" x 160));
+
+# send own check, nominating alternative port
+($packet, $tid) = NGCP::Rtpclient::ICE::stun_req(1, 65534, 1, 'q2758e93', $ufrag_a, $pwd_a, 1);
+snd($sock_b, $port_b, $packet);
+rcv($sock_b, -1, qr/^\x01\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine/s);
+
+($packet, $tid) = NGCP::Rtpclient::ICE::stun_req(1, 65534, 2, 'q2758e93', $ufrag_a, $pwd_a, 1);
+snd($sock_bx, $port_bx, $packet);
+rcv($sock_bx, -1, qr/^\x01\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine/s);
+
+# ICE completed, alternate port nominated
+
+# RTP plain -> ICE ok now on alternate port
+snd($sock_c, $port_a,  rtp(8, 3003, 5480, 0x1a04, "\x88" x 160));
+rcv($sock_b, $port_c, rtpm(8, 3003, 5480, 0x1a04, "\x88" x 160));
+
+# RTP ICE -> plain from/to alternative port
+snd($sock_b, $port_c,  rtp(8, 1002, 3320, 0x1234, "\x99" x 160));
+rcv($sock_c, $port_a, rtpm(8, 1002, 3320, 0x1234, "\x99" x 160));
+
+# RTP plain -> ICE ok on alternate port
+snd($sock_c, $port_a,  rtp(8, 3004, 5640, 0x1a04, "\x88" x 160));
+rcv($sock_b, $port_c, rtpm(8, 3004, 5640, 0x1a04, "\x88" x 160));
+
+# RTP ICE -> plain, silently switch to primary port
+snd($sock_a, $port_c,  rtp(8, 1003, 3480, 0x1234, "\x99" x 160));
+rcv($sock_c, $port_a, rtpm(8, 1003, 3480, 0x1234, "\x99" x 160));
+
+# RTP plain -> ICE still on alternate port
+snd($sock_c, $port_a,  rtp(8, 3005, 5800, 0x1a04, "\x88" x 160));
+rcv($sock_b, $port_c, rtpm(8, 3005, 5800, 0x1a04, "\x88" x 160));
+
+Time::HiRes::usleep(3100000); # wait out delay
+
+# RTP ICE -> plain, still on primary port
+snd($sock_a, $port_c,  rtp(8, 1004, 3640, 0x1234, "\x99" x 160));
+rcv($sock_c, $port_a, rtpm(8, 1004, 3640, 0x1234, "\x99" x 160));
+
+# RTP plain -> ICE still now on primary port
+snd($sock_c, $port_a,  rtp(8, 3006, 5960, 0x1a04, "\x88" x 160));
+rcv($sock_a, $port_c, rtpm(8, 3006, 5960, 0x1a04, "\x88" x 160));
+
+
+
+
+
+($sock_a, $sock_ax, $sock_b, $sock_bx, $sock_c, $sock_cx) = new_call(
+	[qw(198.51.100.36 4060)], [qw(198.51.100.36 4061)],
+	[qw(198.51.100.37 5060)], [qw(198.51.100.37 5061)],
+	[qw(198.51.100.38 6060)], [qw(198.51.100.38 6061)],
+);
+
+($port_a, $port_ax) = offer('ICE + no endpoint learning', { ICE => 'remove', 'endpoint-learning' => 'off' }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.4
+s=tester
+c=IN IP4 198.51.100.36
+t=0 0
+a=sendrecv
+m=audio 4060 RTP/AVP 0
+a=ice-pwd:bd5e8b8d6dd8e1bc6
+a=ice-ufrag:q2758e93
+a=candidate:aaa 1 UDP 2130706431 198.51.100.36 4060 typ host
+a=candidate:aaa 2 UDP 2130706430 198.51.100.36 4061 typ host
+a=candidate:bbb 1 UDP 2130706175 198.51.100.37 5060 typ host
+a=candidate:bbb 2 UDP 2130706174 198.51.100.37 5061 typ host
+--------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.4
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+(undef, undef, $ufrag_a, $pwd_a) = answer('ICE + no endpoint learning', { 'endpoint-learning' => 'off' }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.4
+s=tester
+c=IN IP4 198.51.100.38
+t=0 0
+a=sendrecv
+m=audio 6060 RTP/AVP 0
+--------------------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.4
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+a=ice-ufrag:ICEUFRAG
+a=ice-pwd:ICEPWD
+a=candidate:ICEBASE 1 UDP 2130706431 203.0.113.1 PORT typ host
+a=candidate:ICEBASE 1 UDP 2130706175 2001:db8:4321::1 PORT typ host
+a=candidate:ICEBASE 2 UDP 2130706430 203.0.113.1 PORT typ host
+a=candidate:ICEBASE 2 UDP 2130706174 2001:db8:4321::1 PORT typ host
+SDP
+
+# consume initial STUN checks, but don't respond
+($port_c) = rcv($sock_a, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42/s);
+($port_b) = rcv($sock_b, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42/s);
+is($port_b, $port_c, "same source port");
+$port_bx = $port_b + 1;
+
+# RTP plain -> ICE ok
+snd($sock_c, $port_a,  rtp(8, 3000, 5000, 0x1a04, "\x88" x 160));
+rcv($sock_a, $port_c, rtpm(8, 3000, 5000, 0x1a04, "\x88" x 160));
+
+# RTP ICE -> plain from/to alternative port
+snd($sock_b, $port_c,  rtp(8, 1000, 3000, 0x1234, "\x99" x 160));
+# dropped because ICE not authenticated yet
+rcv_no($sock_c);
+
+
+# respond to next STUN check
+@ret1 = rcv($sock_a, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine.*?\x00\x06\x00\x11q2758e93:(........)\x00\x00\x00\x80\x29\x00\x08........\x00\x24\x00\x04\x6e\xff\xff\xff\x00\x08\x00\x14....................\x80\x28\x00\x04....$/s);
+@ret2 = rcv($sock_b, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine.*?\x00\x06\x00\x11q2758e93:(........)\x00\x00\x00\x80\x29\x00\x08........\x00\x24\x00\x04\x6e\xff\xff\xff\x00\x08\x00\x14....................\x80\x28\x00\x04....$/s);
+
+snd($sock_a, $port_b, NGCP::Rtpclient::ICE::stun_succ($ret1[0], $ret1[2], 'bd5e8b8d6dd8e1bc6'));
+snd($sock_b, $port_b, NGCP::Rtpclient::ICE::stun_succ($ret2[0], $ret2[2], 'bd5e8b8d6dd8e1bc6'));
+
+# respond to STUN on RTCP
+
+@ret1 = rcv($sock_ax, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine.*?\x00\x06\x00\x11q2758e93:(........)\x00\x00\x00\x80\x29\x00\x08........\x00\x24\x00\x04\x6e\xff\xff\xfe\x00\x08\x00\x14....................\x80\x28\x00\x04....$/s);
+@ret2 = rcv($sock_bx, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine.*?\x00\x06\x00\x11q2758e93:(........)\x00\x00\x00\x80\x29\x00\x08........\x00\x24\x00\x04\x6e\xff\xff\xfe\x00\x08\x00\x14....................\x80\x28\x00\x04....$/s);
+
+snd($sock_ax, $port_bx, NGCP::Rtpclient::ICE::stun_succ($ret1[0], $ret1[2], 'bd5e8b8d6dd8e1bc6'));
+snd($sock_bx, $port_bx, NGCP::Rtpclient::ICE::stun_succ($ret2[0], $ret2[2], 'bd5e8b8d6dd8e1bc6'));
+
+# both ICE candidates now authenticated, best candidate 'aaa'
+
+# RTP plain -> ICE ok
+snd($sock_c, $port_a,  rtp(8, 3001, 5160, 0x1a04, "\x88" x 160));
+rcv($sock_a, $port_c, rtpm(8, 3001, 5160, 0x1a04, "\x88" x 160));
+
+# RTP ICE -> plain from/to alternative port now ok
+snd($sock_b, $port_c,  rtp(8, 1001, 3160, 0x1234, "\x99" x 160));
+rcv($sock_c, $port_a, rtpm(8, 1001, 3160, 0x1234, "\x99" x 160));
+
+# RTP plain -> ICE ok, still on primary port
+snd($sock_c, $port_a,  rtp(8, 3002, 5320, 0x1a04, "\x88" x 160));
+rcv($sock_a, $port_c, rtpm(8, 3002, 5320, 0x1a04, "\x88" x 160));
+
+# send own check, nominating alternative port
+($packet, $tid) = NGCP::Rtpclient::ICE::stun_req(1, 65534, 1, 'q2758e93', $ufrag_a, $pwd_a, 1);
+snd($sock_b, $port_b, $packet);
+rcv($sock_b, -1, qr/^\x01\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine/s);
+
+($packet, $tid) = NGCP::Rtpclient::ICE::stun_req(1, 65534, 2, 'q2758e93', $ufrag_a, $pwd_a, 1);
+snd($sock_bx, $port_bx, $packet);
+rcv($sock_bx, -1, qr/^\x01\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine/s);
+
+# ICE completed, alternate port nominated
+
+# RTP plain -> ICE ok now on alternate port
+snd($sock_c, $port_a,  rtp(8, 3003, 5480, 0x1a04, "\x88" x 160));
+rcv($sock_b, $port_c, rtpm(8, 3003, 5480, 0x1a04, "\x88" x 160));
+
+# RTP ICE -> plain from/to alternative port
+snd($sock_b, $port_c,  rtp(8, 1002, 3320, 0x1234, "\x99" x 160));
+rcv($sock_c, $port_a, rtpm(8, 1002, 3320, 0x1234, "\x99" x 160));
+
+# RTP plain -> ICE ok on alternate port
+snd($sock_c, $port_a,  rtp(8, 3004, 5640, 0x1a04, "\x88" x 160));
+rcv($sock_b, $port_c, rtpm(8, 3004, 5640, 0x1a04, "\x88" x 160));
+
+# RTP ICE -> plain, silently switch to primary port
+snd($sock_a, $port_c,  rtp(8, 1003, 3480, 0x1234, "\x99" x 160));
+rcv($sock_c, $port_a, rtpm(8, 1003, 3480, 0x1234, "\x99" x 160));
+
+# RTP plain -> ICE still on alternate port
+snd($sock_c, $port_a,  rtp(8, 3005, 5800, 0x1a04, "\x88" x 160));
+rcv($sock_b, $port_c, rtpm(8, 3005, 5800, 0x1a04, "\x88" x 160));
+
+
+
+
 
 ($sock_a, $sock_b) = new_call([qw(198.51.100.21 7294)], [qw(198.51.100.21 7296)]);
 
@@ -1248,29 +1782,29 @@ SDP
 
 # receive STUN req and respond
 (undef, undef, $tid) = rcv($sock_a, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine/s);
-snd($sock_a, $port_b, stun_succ($port_b, $tid, '02K77oy8PHQ2tmz6RjF4gyWB'));
+snd($sock_a, $port_b, NGCP::Rtpclient::ICE::stun_succ($port_b, $tid, '02K77oy8PHQ2tmz6RjF4gyWB'));
 
 # other side
 (undef, undef, $tid) = rcv($sock_b, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine/s);
-snd($sock_b, $port_a, stun_succ($port_a, $tid, '02K77gjdfgdstmz6RjF4gyWB'));
+snd($sock_b, $port_a, NGCP::Rtpclient::ICE::stun_succ($port_a, $tid, '02K77gjdfgdstmz6RjF4gyWB'));
 
 # send our own checks
-($packet, $tid) = stun_req(1, 65527, 1, 'UXPd', $ufrag_b, $pwd_b);
+($packet, $tid) = NGCP::Rtpclient::ICE::stun_req(1, 65527, 1, 'UXPd', $ufrag_b, $pwd_b);
 snd($sock_a, $port_b, $packet);
 rcv($sock_a, -1, qr/^\x01\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine/s);
 
 # other side
-($packet, $tid) = stun_req(0, 65527, 1, 'sdyv', $ufrag_a, $pwd_a);
+($packet, $tid) = NGCP::Rtpclient::ICE::stun_req(0, 65527, 1, 'sdyv', $ufrag_a, $pwd_a);
 snd($sock_b, $port_a, $packet);
 rcv($sock_b, -1, qr/^\x01\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine/s);
 
 # wait for nomination
 (undef, undef, $tid) = rcv($sock_b, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine.*\x00\x25\x00\x00\x00\x08\x00/s);
-snd($sock_b, $port_a, stun_succ($port_a, $tid, '02K77gjdfgdstmz6RjF4gyWB'));
+snd($sock_b, $port_a, NGCP::Rtpclient::ICE::stun_succ($port_a, $tid, '02K77gjdfgdstmz6RjF4gyWB'));
 # ICE now completed
 
 # we nominate
-($packet, $tid) = stun_req(1, 65527, 1, 'UXPd', $ufrag_b, $pwd_b, 1);
+($packet, $tid) = NGCP::Rtpclient::ICE::stun_req(1, 65527, 1, 'UXPd', $ufrag_b, $pwd_b, 1);
 snd($sock_a, $port_b, $packet);
 rcv($sock_a, -1, qr/^\x01\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine/s);
 # ICE now completed
@@ -6457,7 +6991,7 @@ a=ssrc:1948313614 cname:Kk01/qU0PWi9Cacd
 a=content:main
 a=sendrecv
 a=rtcp:PORT
-m=application 0 RTP/AVP 0
+m=application 0 RTP/AVP 100
 c=IN IP4 0.0.0.0
 a=mid:5
 SDP
@@ -6754,7 +7288,7 @@ a=content:main
 a=sendrecv
 a=rtcp:PORT
 a=rtcp-mux
-m=application 0 RTP/AVP 0
+m=application 0 RTP/AVP 100
 c=IN IP4 0.0.0.0
 a=mid:5
 SDP
@@ -6810,7 +7344,7 @@ c=IN IP6 ::
 b=TIAS:5952000
 a=mid:2
 a=label:11
-m=application 0 RTP/SAVP 96
+m=application 0 RTP/SAVP 0
 c=IN IP4 0.0.0.0
 a=mid:5
 SDP
@@ -12288,8 +12822,10 @@ v=0
 o=- 1545997027 1 IN IP4 172.17.0.2
 s=tester
 t=0 0
-m=audio PORT RTP/AVP 104 110 102 108 8 0 105 100
+m=audio PORT RTP/AVP 109 104 110 102 108 8 0 105 100
 c=IN IP4 203.0.113.1
+a=rtpmap:109 EVS/16000
+a=fmtp:109 br=5.9-24.4; bw=nb-swb; max-red=220; cmr=1; ch-aw-recv=3
 a=rtpmap:104 speex/16000
 a=fmtp:104 max-red=0; mode-change-capability=2
 a=rtpmap:110 speex/16000
@@ -12482,11 +13018,9 @@ c=IN IP4 203.0.113.1
 a=rtpmap:8 PCMA/8000
 a=sendrecv
 a=rtcp:PORT
-m=audio 0 RTP/AVP 8
+m=audio 0 RTP/AVP 0
 c=IN IP4 0.0.0.0
 SDP
-# ^ technically fishy - rejected stream should not do offer/answer and should just
-# pass through 0 instead
 
 
 
@@ -12554,7 +13088,7 @@ rcv($sock_a, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42/s);
 rcv($sock_b, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42/s);
 
 # send our own STUN checks from different port, resulting in learned prflx candidates
-($packet, $tid) = stun_req(1, 65527, 1, 'q27e93', $ufrag_a, $ufrag_b);
+($packet, $tid) = NGCP::Rtpclient::ICE::stun_req(1, 65527, 1, 'q27e93', $ufrag_a, $ufrag_b);
 snd($sock_c, $port_a, $packet);
 
 $has_recv = 0;
@@ -12574,10 +13108,10 @@ while ($has_recv != 3) {
 }
 
 # respond with success
-snd($sock_c, $port_a, stun_succ($port_a, $ret1[1], 'bd5e8b8d6dd8e1bc6'));
+snd($sock_c, $port_a, NGCP::Rtpclient::ICE::stun_succ($port_a, $ret1[1], 'bd5e8b8d6dd8e1bc6'));
 
 # repeat for RTCP
-($packet, $tid) = stun_req(1, 65527, 2, 'q27e93', $ufrag_a, $ufrag_b);
+($packet, $tid) = NGCP::Rtpclient::ICE::stun_req(1, 65527, 2, 'q27e93', $ufrag_a, $ufrag_b);
 snd($sock_d, $port_ax, $packet);
 $has_recv = 0;
 while ($has_recv != 3) {
@@ -12590,7 +13124,7 @@ while ($has_recv != 3) {
 		$has_recv |= 2;
 	}
 }
-snd($sock_d, $port_ax, stun_succ($port_b, $ret1[1], 'bd5e8b8d6dd8e1bc6'));
+snd($sock_d, $port_ax, NGCP::Rtpclient::ICE::stun_succ($port_b, $ret1[1], 'bd5e8b8d6dd8e1bc6'));
 
 
 
@@ -12659,7 +13193,7 @@ rcv($sock_a, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42/s);
 rcv($sock_b, -1, qr/^\x00\x01\x00.\x21\x12\xa4\x42/s);
 
 # send our own STUN checks from different port, resulting in learned prflx candidates
-($packet, $tid) = stun_req(0, 65527, 1, 'q27e93', $ufrag_a, $ufrag_b);
+($packet, $tid) = NGCP::Rtpclient::ICE::stun_req(0, 65527, 1, 'q27e93', $ufrag_a, $ufrag_b);
 snd($sock_c, $port_a, $packet);
 
 $has_recv = 0;
@@ -12679,10 +13213,10 @@ while ($has_recv != 3) {
 }
 
 # respond with success
-snd($sock_c, $port_a, stun_succ($port_a, $ret1[1], 'bd5e8b8d6dd8e1bc6'));
+snd($sock_c, $port_a, NGCP::Rtpclient::ICE::stun_succ($port_a, $ret1[1], 'bd5e8b8d6dd8e1bc6'));
 
 # repeat for RTCP
-($packet, $tid) = stun_req(0, 65527, 2, 'q27e93', $ufrag_a, $ufrag_b);
+($packet, $tid) = NGCP::Rtpclient::ICE::stun_req(0, 65527, 2, 'q27e93', $ufrag_a, $ufrag_b);
 snd($sock_d, $port_ax, $packet);
 $has_recv = 0;
 while ($has_recv != 3) {
@@ -12695,7 +13229,7 @@ while ($has_recv != 3) {
 		$has_recv |= 2;
 	}
 }
-snd($sock_d, $port_ax, stun_succ($port_b, $ret1[1], 'bd5e8b8d6dd8e1bc6'));
+snd($sock_d, $port_ax, NGCP::Rtpclient::ICE::stun_succ($port_b, $ret1[1], 'bd5e8b8d6dd8e1bc6'));
 
 # wait for nominations
 @ret1 = rcv($sock_c, $port_a, qr/^\x00\x01\x00.\x21\x12\xa4\x42(............)\x80\x22\x00.rtpengine.*\x00\x25/s);
@@ -19351,12 +19885,12 @@ SDP
 
 # send back RTP binding successes
 
-snd($sock_a, $ret1[0], stun_succ($ret1[0], $ret1[2], 'bd5e845657ecb8d6dd8e1bc6'));
-snd($sock_c, $ret2[0], stun_succ($ret2[0], $ret2[2], 'bd5e845657ecb8d6dd8e1bc6'));
+snd($sock_a, $ret1[0], NGCP::Rtpclient::ICE::stun_succ($ret1[0], $ret1[2], 'bd5e845657ecb8d6dd8e1bc6'));
+snd($sock_c, $ret2[0], NGCP::Rtpclient::ICE::stun_succ($ret2[0], $ret2[2], 'bd5e845657ecb8d6dd8e1bc6'));
 
 # send secondary RTCP binding success
 
-snd($sock_d, $ret4[0], stun_succ($ret4[0], $ret4[2], 'bd5e845657ecb8d6dd8e1bc6'));
+snd($sock_d, $ret4[0], NGCP::Rtpclient::ICE::stun_succ($ret4[0], $ret4[2], 'bd5e845657ecb8d6dd8e1bc6'));
 
 # now we should be getting DTLS
 
@@ -28520,6 +29054,104 @@ SDP
 
 new_call;
 
+offer('webrtc ice2', { flags => ['WebRTC'], ICE => ['ICE2'] }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+c=IN IP4 198.51.100.1
+t=0 0
+m=audio 2000 RTP/AVP 0 8
+----------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+a=group:BUNDLE 1
+m=audio PORT UDP/TLS/RTP/SAVPF 0 8
+c=IN IP4 203.0.113.1
+a=mid:1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=extmap-allow-mixed
+a=extmap:1 urn:ietf:params:rtp-hdrext:sdes:mid
+a=sendrecv
+a=rtcp-mux
+a=setup:actpass
+a=fingerprint:sha-256 FINGERPRINT256
+a=tls-id:TLS_ID
+a=ice-ufrag:ICEUFRAG
+a=ice-pwd:ICEPWD
+a=ice-options:trickle ice2
+a=candidate:ICEBASE 1 UDP 2130706431 203.0.113.1 PORT typ host
+a=candidate:ICEBASE 1 UDP 2130706175 2001:db8:4321::1 PORT typ host
+a=end-of-candidates
+SDP
+
+
+
+
+new_call;
+
+offer('ice2 offer', { ICE => ['remove'] }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+c=IN IP4 198.51.100.1
+t=0 0
+a=sendrecv
+m=audio 2000 RTP/AVP 0
+a=ice-pwd:bd5e8b8d6dd8e1bc6
+a=ice-ufrag:q2758e93
+a=ice-options:trickle ice2
+a=candidate:aaa 1 UDP 2130706431 198.51.100.1 2000 typ host
+a=candidate:aaa 2 UDP 2130706430 198.51.100.1 2001 typ host
+a=end-of-candidates
+----------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+answer('ice2 offer', { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+c=IN IP4 198.51.100.1
+t=0 0
+a=sendrecv
+m=audio 2000 RTP/AVP 0
+----------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.1
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+a=ice-ufrag:ICEUFRAG
+a=ice-pwd:ICEPWD
+a=ice-options:trickle ice2
+a=candidate:ICEBASE 1 UDP 2130706431 203.0.113.1 PORT typ host
+a=candidate:ICEBASE 1 UDP 2130706175 2001:db8:4321::1 PORT typ host
+a=candidate:ICEBASE 2 UDP 2130706430 203.0.113.1 PORT typ host
+a=candidate:ICEBASE 2 UDP 2130706174 2001:db8:4321::1 PORT typ host
+a=end-of-candidates
+SDP
+
+
+
+
+
+new_call;
+
 $resp = rtpe_req('offer', 'SDP with just \n', { 'from-tag' => ft(), SDP => "v=0\no=- 1545997027 1 IN IP4 198.51.101.40\ns=tester\nt=0 0\nm=audio 3000 RTP/AVP 0 8\nc=IN IP4 198.51.100.1\na=foobar\n" } );
 like($resp->{sdp}, qr/\r\na=foobar\r\na=sendrecv\r\na=rtcp:\d+\r\n$/s, 'SDP matches');
 
@@ -28599,7 +29231,7 @@ c=IN IP4 203.0.113.1
 a=rtpmap:8 PCMA/8000
 a=sendrecv
 a=rtcp:PORT
-m=video 0 RTP/AVP 0
+m=video 0 RTP/AVP 97
 c=IN IP4 0.0.0.0
 SDP
 
@@ -28916,6 +29548,176 @@ rcv($sock_d, $port_b, rtpm(98, 6000, 8000, 0x9234, "a"));
 
 snd($sock_d, $port_b,  rtp(98, 8000, 9000, 0xa234, "b"));
 rcv($sock_b, $port_d, rtpm(98, 8000, 9000, 0xa234, "b"));
+
+
+
+# Scenario: initial offer uses a local daemon address (203.0.113.1), triggering LOOP_CHECK. A
+# re-INVITE changes the endpoint to non-local, which should clear it.
+new_call;
+
+offer('loop check cleared on non-local re-INVITE', { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.14
+s=tester
+c=IN IP4 203.0.113.1
+t=0 0
+m=audio 30130 RTP/AVP 0
+a=sendrecv
+----------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.14
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+answer('loop check cleared on non-local re-INVITE', { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.14
+s=tester
+c=IN IP4 198.51.100.3
+t=0 0
+m=audio 6132 RTP/AVP 0
+a=sendrecv
+----------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.14
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+$resp = rtpe_req('query', 'loop check cleared on non-local re-INVITE', { });
+ok(grep {$_ eq 'loop check'} @{$resp->{tags}{ft()}{medias}[0]{flags}},
+	'loop check flag set with local endpoint');
+
+# re-INVITE: endpoint changes to non-local address
+offer('loop check cleared on non-local re-INVITE', { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.14
+s=tester
+c=IN IP4 198.51.100.1
+t=0 0
+m=audio 6130 RTP/AVP 0
+a=sendrecv
+----------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.14
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+answer('loop check cleared on non-local re-INVITE', { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.14
+s=tester
+c=IN IP4 198.51.100.3
+t=0 0
+m=audio 6132 RTP/AVP 0
+a=sendrecv
+----------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.14
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+$resp = rtpe_req('query', 'loop check cleared on non-local re-INVITE', { });
+ok(!grep {$_ eq 'loop check'} @{$resp->{tags}{ft()}{medias}[0]{flags}},
+	'loop check flag cleared after non-local re-INVITE');
+
+
+
+# Scenario: duplicate packets arriving >1s apart should not trigger loop detection. With loop check
+# enabled, 32 rapid identical packets trigger a drop. After waiting >1s, the time-based reset allows
+# the same packet through again.
+
+($sock_a, $sock_b) = new_call([qw(198.51.100.1 6140)], [qw(198.51.100.3 6142)]);
+
+($port_a) = offer('loop detection time reset', { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.14
+s=tester
+c=IN IP4 203.0.113.1
+t=0 0
+m=audio 30140 RTP/AVP 0
+a=sendrecv
+----------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.14
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+($port_b) = answer('loop detection time reset', { }, <<SDP);
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.14
+s=tester
+c=IN IP4 198.51.100.3
+t=0 0
+m=audio 6142 RTP/AVP 0
+a=sendrecv
+----------------------------
+v=0
+o=- 1545997027 1 IN IP4 198.51.100.14
+s=tester
+t=0 0
+m=audio PORT RTP/AVP 0
+c=IN IP4 203.0.113.1
+a=rtpmap:0 PCMU/8000
+a=sendrecv
+a=rtcp:PORT
+SDP
+
+my $dup_pkt = rtp(0, 1000, 3000, 0x1234, "\x00" x 160);
+my $dup_match = rtpm(0, 1000, 3000, 0x1234, "\x00" x 160);
+
+# establish the call with a different packet first
+snd($sock_a, $port_b, rtp(0, 999, 2000, 0x1234, "\x00" x 160));
+rcv($sock_b, $port_a, rtpm(0, 999, 2000, 0x1234, "\x00" x 160));
+
+# send 31 identical packets
+for (1..31) {
+	snd($sock_a, $port_b, $dup_pkt);
+	rcv($sock_b, $port_a, $dup_match);
+}
+
+# 32nd packet, dropped
+snd($sock_a, $port_b, $dup_pkt);
+rcv_no($sock_b, $port_a);
+
+# 32nd packet, dropped again
+snd($sock_a, $port_b, $dup_pkt);
+rcv_no($sock_b, $port_a);
+
+# after >1s, the 32nd packet passes through
+sleep(2);
+
+snd($sock_a, $port_b, $dup_pkt);
+rcv($sock_b, $port_a, $dup_match);
 
 
 

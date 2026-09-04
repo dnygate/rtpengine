@@ -9,7 +9,7 @@
 
 #include "compat.h"
 #include "call.h"
-#include "log.h"
+#include "log_d.h"
 #include "str.h"
 #include "crypto.h"
 #include "dtls.h"
@@ -1601,6 +1601,8 @@ static bool __rtp_payload_types(struct stream_params *sp, struct sdp_media *medi
 
 	if (!proto_is_rtp(sp->protocol))
 		return true;
+	if (sp->rtp_endpoint.port == 0)
+		return true;
 
 	/* first go through a=rtpmap and build a hash table of attrs */
 	g_autoptr(GHashTable) ht_rtpmap = g_hash_table_new(g_direct_hash, g_direct_equal);
@@ -1716,6 +1718,8 @@ no_cand:
 	if ((attr = attr_get_by_id_m_s(media, ATTR_ICE_OPTIONS))) {
 		if (str_str(&attr->strs.value, "trickle") >= 0)
 			SP_SET(sp, TRICKLE_ICE);
+		if (str_str(&attr->strs.value, "ice2") >= 0)
+			SP_SET(sp, ICE2);
 	}
 	else if (is_trickle_ice_address(&sp->rtp_endpoint))
 		SP_SET(sp, TRICKLE_ICE);
@@ -2246,7 +2250,10 @@ static void print_codec_list(GString *s, struct call_media *media) {
 
 	if (media->codecs.codec_prefs.length == 0) {
 		// legacy protocol, usage error, or allow-no-codec-media set. Print something and bail
-		g_string_append(s, "0");
+		if (media->format_str.len)
+			print_format_str(s, media);
+		else
+			g_string_append(s, "0");
 		return;
 	}
 
@@ -2965,8 +2972,16 @@ static void print_sdp_media_section(GString *s, struct call_media *media,
 				media->type_id);
 	}
 
-	if (MEDIA_ISSET(media, TRICKLE_ICE) && ice_agent) {
-		append_attr_to_gstring(s, "ice-options", &STR_CONST("trickle"), flags,
+	if (MEDIA_ISSET2(media, TRICKLE_ICE, ICE2) && ice_agent) {
+		str opts;
+		if (!MEDIA_ISSET(media, ICE2))
+			opts = STR_CONST("trickle");
+		else if (!MEDIA_ISSET(media, TRICKLE_ICE))
+			opts = STR_CONST("ice2");
+		else
+			opts = STR_CONST("trickle ice2");
+
+		append_attr_to_gstring(s, "ice-options", &opts, flags,
 				media->type_id);
 	}
 	if (MEDIA_ISSET(media, ICE)) {

@@ -12,7 +12,7 @@
 #include <sys/eventfd.h>
 
 #include "helpers.h"
-#include "log.h"
+#include "log_d.h"
 #include "bufferpool.h"
 #include "main.h"
 #include "statistics.h"
@@ -51,12 +51,21 @@ fail:
 	return false;
 }
 
-static bool kernel_create_table(unsigned int id) {
+bool kernel_create_table(unsigned int id) {
 	return kernel_action_table("add", id);
 }
 
-static bool kernel_delete_table(unsigned int id) {
-	return kernel_action_table("del", id);
+bool kernel_delete_table(unsigned int id) {
+	for (unsigned int i = 0; i < 5; i++) {
+		bool ok = kernel_action_table("del", id);
+		if (ok)
+			return true;
+		if (errno != EBUSY)
+			return false;
+		usleep(20000);
+	}
+
+	return false;
 }
 
 static void kernel_pin_memory(void *b, size_t len) {
@@ -142,7 +151,6 @@ bool kernel_init_table(void) {
 				[REMG_ADD_CALL] = sizeof(struct rtpengine_command_add_call),
 				[REMG_DEL_CALL] = sizeof(struct rtpengine_command_del_call),
 				[REMG_ADD_STREAM] = sizeof(struct rtpengine_command_add_stream),
-				[REMG_DEL_STREAM] = sizeof(struct rtpengine_command_del_stream),
 				[REMG_PACKET] = sizeof(struct rtpengine_command_packet),
 				[REMG_INIT_PLAY_STREAMS] = sizeof(struct rtpengine_command_init_play_streams),
 				[REMG_GET_PACKET_STREAM] = sizeof(struct rtpengine_command_get_packet_stream),
@@ -170,16 +178,6 @@ bool kernel_setup_table(unsigned int id) {
 
 	kernel.is_wanted = true;
 
-	if (!kernel_delete_table(id) && errno != ENOENT) {
-		ilog(LOG_ERR, "FAILED TO DELETE KERNEL TABLE %i (%s), KERNEL FORWARDING DISABLED",
-				id, strerror(errno));
-		return false;
-	}
-	if (!kernel_create_table(id)) {
-		ilog(LOG_ERR, "FAILED TO CREATE KERNEL TABLE %i (%s), KERNEL FORWARDING DISABLED",
-				id, strerror(errno));
-		return false;
-	}
 	int fd = kernel_open_table(id);
 	if (fd == -1) {
 		ilog(LOG_ERR, "FAILED TO OPEN KERNEL TABLE %i (%s), KERNEL FORWARDING DISABLED",
@@ -560,7 +558,7 @@ void kernel_init_pollers(unsigned int num) {
 
 static void wake_eventfd(struct thread_waker *wk) {
 	int64_t a = 1;
-	(void) write(GPOINTER_TO_INT(wk->arg), &a, sizeof(a));
+	ssize_t ret __attribute__((unused)) = write(GPOINTER_TO_INT(wk->arg), &a, sizeof(a));
 }
 
 static void wait_eventfd(int fd) {

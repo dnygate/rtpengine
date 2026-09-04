@@ -29,7 +29,7 @@
 #include "control_udp.h"
 #include "control_ng.h"
 #include "helpers.h"
-#include "log.h"
+#include "log_d.h"
 #include "call.h"
 #include "kernel.h"
 #include "redis.h"
@@ -59,7 +59,6 @@
 #include "janus.h"
 #include "nftables.h"
 #include "bufferpool.h"
-#include "log_funcs.h"
 #include "uring.h"
 #include "ng_client.h"
 
@@ -358,12 +357,16 @@ static bool if_add(intf_config_q *q, struct ifaddrs *ifas, const str *name,
 	/* address */
 	sockaddr_t *addr = g_new(__typeof(*addr), 1);
 	if (sockaddr_parse_any(addr, address)) {
-		if (is_addr_unspecified(addr))
+		if (is_addr_unspecified(addr)) {
+			g_free(addr);
 			return false;
+		}
 		g_queue_push_tail(&addrs, addr);
 	}
 	else {
 		g_free(addr);
+		addr = NULL;
+
 		// could be an interface name?
 		ilog(LOG_DEBUG, "Could not parse '%s' as network address, checking to see if "
 				"it's an interface", address);
@@ -373,10 +376,12 @@ static bool if_add(intf_config_q *q, struct ifaddrs *ifas, const str *name,
 			ilog(LOG_DEBUG, "'%s' is not an interface, attempting to resolve it as DNS host name", address);
 			__resolve_ifname(address, &addrs);
 		}
-	}
 
-	if (!addrs.length) // nothing found
-		return false;
+		// if still nothing found
+		if (!addrs.length) {
+			return false;
+		}
+	}
 
 	sockaddr_t adv = {0};
 	if (adv_addr) {
@@ -387,8 +392,10 @@ static bool if_add(intf_config_q *q, struct ifaddrs *ifas, const str *name,
 				return false;
 			}
 		}
-		if (is_addr_unspecified(&adv))
+		if (is_addr_unspecified(&adv)) {
+			g_free(addr);
 			return false;
+		}
 	}
 
 	while ((addr = g_queue_pop_head(&addrs))) {
@@ -492,7 +499,7 @@ static void do_transcode_config(const char *name, charp_ht ht, struct transcode_
 	if (!codec_parse_payload_type(&tc->i.src, STR_PTR(tc->src)))
 		die("Failed to parse source codec '%s' in transcode config '%s'", src, name);
 	if (!codec_parse_payload_type(&tc->i.dst, STR_PTR(tc->dst)))
-		die("Failed to parse source codec '%s' in transcode config '%s'", src, name);
+		die("Failed to parse destination codec '%s' in transcode config '%s'", dst, name);
 
 	char *tfm = t_hash_table_lookup(ht, "transform");
 	char *pref_s = t_hash_table_lookup(ht, "preference");
@@ -747,13 +754,15 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 	g_autoptr(char) templates_section = NULL;
 	g_autoptr(char) interfaces_config = NULL;
 	g_autoptr(char) transcode_config = NULL;
+	g_autoptr(char) ssrc_reporting = NULL;
 	int silent_timeout = 0;
 	int timeout = 0;
 	int final_timeout = 0;
 	int offer_timeout = 0;
 	int delete_delay = 30;
-	int media_expire = 0;
-	int db_expire = 0;
+	int media_files_expire = 0;
+	int db_media_expire = 0;
+	int db_cache_expire = 0;
 	int rtcp_interval = 0;
 	int redis_disable_time = 10;
 	int mqtt_publish_interval = 5000;
@@ -858,6 +867,7 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 		{ "recording-method",0, 0, G_OPTION_ARG_STRING,	&rtpe_config.rec_method,	"Strategy for call recording",		"pcap|proc|all"	},
 		{ "recording-format",0, 0, G_OPTION_ARG_STRING,	&rtpe_config.rec_format,	"File format for stored pcap files",	"raw|eth"	},
 		{ "record-egress",0, 0, G_OPTION_ARG_NONE,	&rtpe_config.rec_egress,	"Recording egress media instead of ingress",	NULL	},
+		{ "record-both",0, 0, G_OPTION_ARG_NONE,	&rtpe_config.rec_both,	"Record both ingress and egress media",	NULL	},
 #ifdef HAVE_LIBIPTC
 		{ "iptables-chain",0,0,	G_OPTION_ARG_STRING,	&rtpe_config.iptables_chain,"Add explicit firewall rules to this iptables chain","STRING" },
 #endif
@@ -900,8 +910,8 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 #ifdef WITH_TRANSCODING
 		{ "dtx-delay",	0,0,	G_OPTION_ARG_INT,	&dtx_delay,		"Delay in milliseconds to trigger DTX handling","INT"},
 		{ "max-dtx",	0,0,	G_OPTION_ARG_INT,	&max_dtx,		"Maximum duration of DTX handling",	"INT"},
-		{ "dtx-buffer",	0,0,	G_OPTION_ARG_INT,	&rtpe_config.dtx_buffer,"Maxmium number of packets held in DTX buffer",	"INT"},
-		{ "dtx-lag",	0,0,	G_OPTION_ARG_INT,	&dtx_lag,		"Maxmium time span in milliseconds held in DTX buffer",	"INT"},
+		{ "dtx-buffer",	0,0,	G_OPTION_ARG_INT,	&rtpe_config.dtx_buffer,"Maximum number of packets held in DTX buffer",	"INT"},
+		{ "dtx-lag",	0,0,	G_OPTION_ARG_INT,	&dtx_lag,		"Maximum time span in milliseconds held in DTX buffer",	"INT"},
 		{ "dtx-shift",	0,0,	G_OPTION_ARG_INT,	&dtx_shift,		"Length of time (in ms) to shift DTX buffer after over/underflow",	"INT"},
 		{ "dtx-cn-params",0,0,	G_OPTION_ARG_STRING_ARRAY,&dtx_cn_params,	"Parameters for CN generated from DTX","INT INT INT ..."},
 		{ "amr-dtx", 0,0,	G_OPTION_ARG_STRING,	&amr_dtx,		"DTX mechanism to use for AMR and AMR-WB","native|CN"},
@@ -913,15 +923,15 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 		{ "kernel-player-media",0,0,G_OPTION_ARG_INT,	&rtpe_config.kernel_player_media,"Max number of kernel media files","INT"},
 		{ "preload-media-files",0,0,G_OPTION_ARG_FILENAME_ARRAY,&rtpe_config.preload_media_files,"Preload media file(s) for playback into memory","FILE"},
 		{ "media-files-reload",0,0,G_OPTION_ARG_INT,	&rtpe_config.media_refresh,"Refresh/reload preloaded media files at a certain interval","SECONDS"},
-		{ "media-files-expire",0,0,G_OPTION_ARG_INT,	&media_expire,		"Maximum age of unused cached media files","SECONDS"},
+		{ "media-files-expire",0,0,G_OPTION_ARG_INT,	&media_files_expire,		"Maximum age of unused cached media files","SECONDS"},
 		{ "expiry-timer",0,0,G_OPTION_ARG_INT,		&rtpe_config.expiry_timer,"How often to check for expired media cache entries","SECONDS"},
 		{ "preload-db-media",0,0,G_OPTION_ARG_STRING_ARRAY,&rtpe_config.preload_db_media,"Preload media from database for playback into memory","INT"},
 		{ "db-media-reload",0,0,G_OPTION_ARG_INT,	&rtpe_config.db_refresh,"Reload preloaded media from DB at a certain interval","SECONDS"},
-		{ "db-media-expire",0,0,G_OPTION_ARG_INT,	&db_expire,		"Maximum age of unused cached DB media entries","SECONDS"},
+		{ "db-media-expire",0,0,G_OPTION_ARG_INT,	&db_media_expire,		"Maximum age of unused cached DB media entries","SECONDS"},
 		{ "db-media-cache",0,0,	G_OPTION_ARG_FILENAME,	&rtpe_config.db_media_cache,"Directory to store media loaded from database","PATH"},
 		{ "preload-db-cache",0,0,G_OPTION_ARG_STRING_ARRAY,&rtpe_config.preload_db_cache,"Preload media from database for playback into file cache","INT"},
 		{ "db-cache-reload",0,0,G_OPTION_ARG_INT,	&rtpe_config.cache_refresh,"Refresh/reload cached media from DB at a certain interval","SECONDS"},
-		{ "db-cache-expire",0,0,G_OPTION_ARG_INT,	&rtpe_config.cache_expire,"Maximum age of unused cached DB entries in files","SECONDS"},
+		{ "db-cache-expire",0,0,G_OPTION_ARG_INT,	&db_cache_expire,"Maximum age of unused cached DB entries in files","SECONDS"},
 		{ "audio-buffer-length",0,0,	G_OPTION_ARG_INT,&rtpe_config.audio_buffer_length,"Length in milliseconds of audio buffer","INT"},
 		{ "audio-buffer-delay",0,0,	G_OPTION_ARG_INT,&rtpe_config.audio_buffer_delay,"Initial delay in milliseconds for buffered audio","INT"},
 		{ "audio-player",0,0,	G_OPTION_ARG_STRING,	&use_audio_player,	"When to enable the internal audio player","on-demand|play-media|transcoding|always"},
@@ -946,6 +956,7 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 #endif
 		{ "mos",0,0,		G_OPTION_ARG_STRING_ARRAY,&mos_options,		"MOS calculation options",		"CQ|LQ"},
 		{ "measure-rtp",0,0,	G_OPTION_ARG_NONE,	&rtpe_config.measure_rtp,"Enable measuring RTP statistics and VoIP metrics",NULL},
+		{ "ssrc-reporting",0,0,	G_OPTION_ARG_STRING,	&ssrc_reporting,	"Format of SSRC stats returned by delete/query","full|inline|global|none"},
 #ifdef SO_INCOMING_CPU
 		{ "socket-cpu-affinity",0,0,G_OPTION_ARG_INT,	&rtpe_config.cpu_affinity,"CPU affinity for media sockets","INT"},
 #endif
@@ -1071,14 +1082,21 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 					});
 			exit(xv);
 		}
-		if (nftables_start)
+		if (nftables_start) {
+			g_free(nftables_shutdown(rtpe_config.nftables_chain, rtpe_config.nftables_base_chain,
+					(nftables_args) {
+						.table = rtpe_config.kernel_table,
+						.family = rtpe_config.nftables_family,
+					}));
 			err = nftables_setup(rtpe_config.nftables_chain, rtpe_config.nftables_base_chain,
 					(nftables_args) {
 						.table = rtpe_config.kernel_table,
 						.append = rtpe_config.nftables_append,
 						.family = rtpe_config.nftables_family,
 						.xtables = rtpe_config.xtables,
+						.may_exist = true,
 					});
+		}
 		else // nftables_stop
 			err = nftables_shutdown(rtpe_config.nftables_chain, rtpe_config.nftables_base_chain,
 					(nftables_args) {
@@ -1225,12 +1243,16 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 	if (rtpe_config.delete_delay_us < 0)
 		die("Invalid negative delete-delay");
 
-	rtpe_config.media_expire_us = media_expire * 1000000LL;
-	if (rtpe_config.media_expire_us < 0)
+	rtpe_config.media_files_expire_us = media_files_expire * 1000000LL;
+	if (rtpe_config.media_files_expire_us < 0)
 		die("Invalid negative media-files-expire");
 
-	rtpe_config.db_expire_us = db_expire * 1000000LL;
-	if (rtpe_config.db_expire_us < 0)
+	rtpe_config.db_cache_expire_us = db_cache_expire * 1000000LL;
+	if (rtpe_config.db_cache_expire_us < 0)
+		die("Invalid negative db-cache-expire");
+
+	rtpe_config.db_media_expire_us = db_media_expire * 1000000LL;
+	if (rtpe_config.db_media_expire_us < 0)
 		die("Invalid negative db-media-expire");
 
 	rtpe_config.rtcp_interval_us = rtcp_interval * 1000LL;
@@ -1238,11 +1260,28 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 		rtpe_config.rtcp_interval_us = 5000 * 1000LL;
 
 	rtpe_config.redis_disable_time_us = redis_disable_time * 1000000LL;
+	if (rtpe_config.redis_disable_time_us < 0)
+		die("Invalid negative redis-disable-time");
+
 	rtpe_config.mqtt_publish_interval_us = mqtt_publish_interval * 1000LL;
+	if (rtpe_config.mqtt_publish_interval_us < 0)
+		die("Invalid negative mqtt-publish-interval");
+
 	rtpe_config.dtx_lag_us = dtx_lag * 1000LL;
+	if (rtpe_config.dtx_lag_us < 0)
+		die("Invalid negative dtx-lag");
+
 	rtpe_config.dtx_delay_us = dtx_delay * 1000LL;
+	if (rtpe_config.dtx_delay_us < 0)
+		die("Invalid negative dtx-delay");
+
 	rtpe_config.dtx_shift_us = dtx_shift * 1000LL;
+	if (rtpe_config.dtx_shift_us < 0)
+		die("Invalid negative dtx-shift");
+
 	rtpe_config.max_dtx_us = max_dtx * 1000000LL;
+	if (rtpe_config.max_dtx_us < 0)
+		die("Invalid negative max-dtx");
 
 	if (redisps) {
 		if (redis_ep_parse(&rtpe_config.redis_ep, &rtpe_config.redis_db, &rtpe_config.redis_hostname,
@@ -1277,21 +1316,21 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 	if (log_facility_cdr_s) {
 		if (!parse_log_facility(log_facility_cdr_s, &_log_facility_cdr)) {
 			print_available_log_facilities();
-			die ("Invalid log facility for CDR '%s' (--log-facility-cdr)", log_facility_cdr_s);
+			die("Invalid log facility for CDR '%s' (--log-facility-cdr)", log_facility_cdr_s);
 		}
 	}
 
 	if (log_facility_rtcp_s) {
 		if (!parse_log_facility(log_facility_rtcp_s, &_log_facility_rtcp)) {
 			print_available_log_facilities();
-			die ("Invalid log facility for RTCP '%s' (--log-facility-rtcp)n", log_facility_rtcp_s);
+			die("Invalid log facility for RTCP '%s' (--log-facility-rtcp)", log_facility_rtcp_s);
 		}
 	}
 
 	if (log_facility_dtmf_s) {
 		if (!parse_log_facility(log_facility_dtmf_s, &_log_facility_dtmf)) {
 			print_available_log_facilities();
-			die ("Invalid log facility for DTMF '%s' (--log-facility-dtmf)n", log_facility_dtmf_s);
+			die("Invalid log facility for DTMF '%s' (--log-facility-dtmf)", log_facility_dtmf_s);
 		}
 	}
 
@@ -1509,6 +1548,19 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 			die("Invalid --control-pmtu option ('%s')", control_pmtu);
 	}
 
+	if (ssrc_reporting) {
+		if (!strcasecmp(ssrc_reporting, "full"))
+			rtpe_config.ssrc_reporting = SRP_FULL;
+		else if (!strcasecmp(ssrc_reporting, "inline"))
+			rtpe_config.ssrc_reporting = SRP_INLINE;
+		else if (!strcasecmp(ssrc_reporting, "global"))
+			rtpe_config.ssrc_reporting = SRP_GLOBAL;
+		else if (!strcasecmp(ssrc_reporting, "none"))
+			rtpe_config.ssrc_reporting = SRP_NONE;
+		else
+			die("Invalid --ssrc-reporting option ('%s')", ssrc_reporting);
+	}
+
 #define STR_LEN_INIT(x) if (rtpe_config.x.s) rtpe_config.x.len = strlen(rtpe_config.x.s)
 	STR_LEN_INIT(vsc_start_rec);
 	STR_LEN_INIT(vsc_stop_rec);
@@ -1576,6 +1628,14 @@ RTPE_CONFIG_ENUM_PARAMS
 
 #define X(s) ini_rtpe_cfg->s = g_strdup(rtpe_config.s);
 RTPE_CONFIG_CHARP_PARAMS
+#undef X
+
+#define X(s) ini_rtpe_cfg->s = g_strdupv(rtpe_config.s);
+RTPE_CONFIG_CHARPP_PARAMS
+#undef X
+
+#define X(s) ini_rtpe_cfg->s = str_dup_str(&rtpe_config.s);
+RTPE_CONFIG_STR_PARAMS
 #undef X
 
 	memcpy(&ini_rtpe_cfg->common.log_levels, &rtpe_config.common.log_levels, sizeof(ini_rtpe_cfg->common.log_levels));
@@ -1654,6 +1714,7 @@ static void early_init(void) {
 static void clib_init(void) {
 	media_bufferpool = bufferpool_new(bufferpool_aligned_alloc, bufferpool_aligned_free);
 	uring_thread_init();
+	kernel_thread_init();
 }
 static void clib_cleanup(void) {
 	bufferpool_destroy(media_bufferpool);
@@ -1667,8 +1728,27 @@ static void clib_loop(void) {
 
 static void kernel_setup(void) {
 	g_autoptr(char) err = NULL;
+
 	if (rtpe_config.kernel_table < 0)
 		goto fallback;
+
+#ifndef WITHOUT_NFTABLES
+	// ignore errors
+	g_free(nftables_shutdown(rtpe_config.nftables_chain, rtpe_config.nftables_base_chain,
+			(nftables_args) {
+				.table = rtpe_config.kernel_table,
+				.family = rtpe_config.nftables_family,
+			}));
+#endif
+
+	if (!kernel_delete_table(rtpe_config.kernel_table) && errno != ENOENT) {
+		ilog(LOG_ERR, "FAILED TO DELETE KERNEL TABLE %i (%s), KERNEL FORWARDING DISABLED",
+				rtpe_config.kernel_table, strerror(errno));
+		if (rtpe_config.no_fallback)
+			die("Userspace fallback disallowed - exiting");
+		goto fallback;
+	}
+
 #ifndef WITHOUT_NFTABLES
 	err = nftables_setup(rtpe_config.nftables_chain, rtpe_config.nftables_base_chain,
 			(nftables_args) {.table = rtpe_config.kernel_table,
@@ -1682,6 +1762,17 @@ static void kernel_setup(void) {
 				"%s", err);
 	}
 #endif
+
+	if (rtpe_config.xtables) {
+		if (!kernel_create_table(rtpe_config.kernel_table)) {
+			ilog(LOG_ERR, "FAILED TO CREATE KERNEL TABLE %i (%s), KERNEL FORWARDING DISABLED",
+					rtpe_config.kernel_table, strerror(errno));
+			if (rtpe_config.no_fallback)
+				die("Userspace fallback disallowed - exiting");
+			goto fallback;
+		}
+	}
+
 	if (!kernel_setup_table(rtpe_config.kernel_table)) {
 		if (rtpe_config.no_fallback)
 			die("Userspace fallback disallowed - exiting");
@@ -1692,6 +1783,16 @@ static void kernel_setup(void) {
 	       if (!kernel_init_player(rtpe_config.kernel_player_media, rtpe_config.kernel_player))
 		       die("Failed to initialise kernel media player");
 	}
+
+	unsigned int num_senders = rtpe_config.kernel_num_threads < 0
+		? rtpe_config.num_threads : rtpe_config.kernel_num_threads;
+
+	if (rtpe_config.kernel_slots <= 0)
+		num_senders = 0;
+
+	rtpe_config.kernel_num_threads = num_senders;
+
+	kernel_init_pollers(num_senders);
 
 	return;
 
@@ -1726,7 +1827,7 @@ static void init_everything(charp_ht templates) {
 	iptables_init();
 	control_ng_init();
 	if (call_interfaces_init(templates))
-		abort();
+		die("Interfaces initialization fatal error");
 	statistics_init();
 #ifdef WITH_TRANSCODING
 	codeclib_thread_init = clib_init;
@@ -1740,7 +1841,7 @@ static void init_everything(charp_ht templates) {
 	jitter_buffer_init();
 	t38_init();
 	if (rtpe_config.mqtt_host && mqtt_init())
-		abort();
+		die("Mosquitto client initialization fatal error");
 	codecs_init();
 	janus_init();
 	if (!kernel_init_table())
@@ -1787,7 +1888,7 @@ static void create_everything(void) {
 	rtpe_poller_threads = g_new0(struct poller_thread, num_poller_threads);
 
 	if (call_init())
-		abort();
+		die("rtpe_callhash initialization fatal error");
 
         rwlock_init(&rtpe_config.keyspaces_lock);
 
@@ -1823,7 +1924,7 @@ static void create_everything(void) {
 		if (!rtpe_redis_notify)
 			die("Cannot start up without running Redis %s subscribe database! See also NO_REDIS_REQUIRED parameter.",
 				endpoint_print_buf(&rtpe_config.redis_subscribe_ep));
-		// subscribed-kespaces takes precedence over db in notify ep
+		// subscribed-keyspaces takes precedence over db in notify ep
 		if (!rtpe_config.redis_subscribed_keyspaces.length) {
 			g_queue_push_tail(&rtpe_config.redis_subscribed_keyspaces, GINT_TO_POINTER(rtpe_config.redis_subscribe_db));
 		}
@@ -2051,13 +2152,8 @@ int main(int argc, char **argv) {
 	}
 
 
-	if (kernel.is_open && rtpe_config.kernel_num_threads != 0 && rtpe_config.kernel_slots > 0) {
-		unsigned int num = rtpe_config.kernel_num_threads < 0
-			? rtpe_config.num_threads : rtpe_config.kernel_num_threads;
-
-		kernel_init_pollers(num);
-
-		for (unsigned int idx = 0; idx < num; ++idx)
+	if (kernel.is_open && rtpe_config.kernel_num_threads > 0 && rtpe_config.kernel_slots > 0) {
+		for (unsigned int idx = 0; idx < rtpe_config.kernel_num_threads; ++idx)
 			thread_create_detach_prio(
 					kernel_poller_loop,
 					GUINT_TO_POINTER(idx),

@@ -6,7 +6,7 @@
 #include <sys/types.h>
 
 #include "call.h"
-#include "log.h"
+#include "log_d.h"
 #include "rtplib.h"
 #include "codeclib.h"
 #include "ssrc.h"
@@ -17,11 +17,10 @@
 #include "t38.h"
 #include "media_player.h"
 #include "timerthread.h"
-#include "log_funcs.h"
 #include "mqtt.h"
 #include "audio_player.h"
 #ifdef WITH_TRANSCODING
-#include "fix_frame_channel_layout.h"
+#include "fix_frame_channel_layout.compat"
 #endif
 #include "bufferpool.h"
 #include "ng_client.h"
@@ -102,7 +101,7 @@ static rtp_pt_list *__codec_store_delete_link(rtp_pt_list *link, struct codec_st
 #include <spandsp/logging.h>
 #include <spandsp/dtmf.h>
 #include "resample.h"
-#include "dtmf_rx_fillin.h"
+#include "dtmf_rx_fillin.compat"
 
 
 
@@ -649,7 +648,7 @@ static const char *__make_transform_handler(struct codec_handler *handler) {
 
 		// create dedicated monologue and dedicated call_media to send media to the
 		// remote rtpengine and forward received media to its designated destination
-		tfh->transform_ml = call_get_or_create_monologue(call, STR_PTR("transform handler"));
+		tfh->transform_ml = call_get_or_create_monologue(call, &ml->call_id, STR_PTR("transform handler"));
 
 		tfh->transform_media = call_make_transform_media(tfh->transform_ml, &media->type, media->type_id,
 				&STR_NULL, &tcc->transform, &tcc->local_interface);
@@ -1875,22 +1874,6 @@ next:
 		if (a.reset_transcoding && ms)
 			ms->attrs.transcoding = true;
 
-		for (__auto_type l = source->codecs.codec_prefs.head; l; ) {
-			rtp_payload_type *pt = l->data;
-
-			if (codec_def_supported(pt->codec_def)) {
-				// supported
-				l = l->next;
-				continue;
-			}
-
-			ilogs(codec, LOG_DEBUG, "Stripping unsupported codec " STR_FORMAT
-					" due to active transcoding",
-					STR_FMT(&pt->encoding));
-			codec_touched(&source->codecs, pt);
-			l = __codec_store_delete_link(l, &source->codecs);
-		}
-
 		if (!use_audio_player || !pref_dest_codec) {
 			// we have to translate RTCP packets
 			source->rtcp_handler = rtcp_transcode_handler;
@@ -2089,19 +2072,21 @@ void mqtt_timer_start(struct mqtt_timer **mqtp, call_t *call, struct call_media 
 
 
 // master lock held in W
+__attribute__((nonnull(1)))
 static void codec_timer_stop(struct codec_timer **ctp) {
-	if (!ctp)
-		return;
 	obj_release(*ctp);
 }
+
 // master lock held in W
+__attribute__((nonnull(1)))
 void rtcp_timer_stop(struct rtcp_timer **rtp) {
 	codec_timer_stop((struct codec_timer **) rtp);
 }
+
+__attribute__((nonnull(1)))
 void mqtt_timer_stop(struct mqtt_timer **mqtp) {
 	codec_timer_stop((struct codec_timer **) mqtp);
 }
-
 
 
 
@@ -2313,7 +2298,7 @@ static int __handler_func_sequencer(struct media_packet *mp, struct transcode_pa
 		seq = g_hash_table_lookup(ssrc_in->sequencers, mp->media_out);
 	if (!seq) {
 		seq = g_new0(__typeof(*seq), 1);
-		packet_sequencer_init(seq, (GDestroyNotify) __transcode_packet_free);
+		packet_sequencer_init(seq, (void (*)(seq_packet_t *)) __transcode_packet_free);
 		g_hash_table_insert(ssrc_in->sequencers, mp->media_out, seq);
 		ssrc_in->media_cache = mp->media_out;
 		ssrc_in->sequencer_cache = seq;
@@ -2322,12 +2307,12 @@ static int __handler_func_sequencer(struct media_packet *mp, struct transcode_pa
 		if(stats_ext_seq) {
 			seq->roc = stats_ext_seq>>16;
 			seq->ext_seq = stats_ext_seq-1;
-			seq->seq = stats_ext_seq & 0xffff;
-			ilog(LOG_DEBUG, "transcode: restoring sequencer, roc: %d ext_seq: %u seq: %u", seq->roc, seq->ext_seq, seq->seq);
+			seq->a_seq = stats_ext_seq & 0xffff;
+			ilog(LOG_DEBUG, "transcode: restoring sequencer, roc: %d ext_seq: %u seq: %u", seq->roc, seq->ext_seq, seq->a_seq);
 		}
 	}
 
-	uint16_t seq_ori = (seq->seq < 0) ? 0 : seq->seq;
+	uint16_t seq_ori = (seq->a_seq == -1u) ? 0 : seq->a_seq;
 	int seq_ret = packet_sequencer_insert(seq, &packet->p);
 	if (seq_ret < 0) {
 		// dupe
@@ -3517,9 +3502,13 @@ static void dtx_packet_free(struct dtx_packet *dtxp) {
 	ssrc_entry_release(dtxp->input_handler);
 	g_free(dtxp);
 }
+
+__attribute__((nonnull(1)))
 static void delay_buffer_stop(struct delay_buffer **pcmbp) {
 	codec_timer_stop((struct codec_timer **) pcmbp);
 }
+
+__attribute__((nonnull(1)))
 static void dtx_buffer_stop(struct dtx_buffer **dtxbp) {
 	codec_timer_stop((struct codec_timer **) dtxbp);
 }
@@ -4276,7 +4265,7 @@ static void __silence_detect_ ## type(struct codec_ssrc_handler *ch, AVFrame *fr
 		last = NULL; \
  \
 	for (unsigned int i = 0; i < frame->nb_samples; i++) { \
-		if (s[i] <= thres && s[1] >= -thres) { \
+		if (s[i] <= thres && s[i] >= -thres) { \
 			/* silence */ \
 			if (!last) { \
 				/* new event */ \
@@ -5027,6 +5016,9 @@ void codec_calc_jitter(struct ssrc_entry_call *ssrc, unsigned long ts, unsigned 
 		ssrc->jitter += d - ((ssrc->jitter + 8) >> 4);
 }
 static void codec_calc_lost(struct ssrc_entry_call *ssrc, uint16_t seq) {
+	if (!ssrc)
+		return;
+
 	LOCK(&ssrc->h.lock);
 
 	// XXX shared code from kernel module

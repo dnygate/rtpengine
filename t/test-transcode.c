@@ -1,7 +1,7 @@
 #include "codec.h"
 #include "call.h"
 #include "call_interfaces.h"
-#include "log.h"
+#include "log_t.h"
 #include "main.h"
 #include "ssrc.h"
 #include "helpers.h"
@@ -19,7 +19,6 @@ struct poller *rtpe_control_poller;
 struct poller *uring_poller;
 unsigned int num_media_pollers;
 unsigned int rtpe_poller_rr_iter;
-GString *dtmf_logs;
 GQueue rtpe_control_ng = G_QUEUE_INIT;
 struct bufferpool *shm_bufferpool;
 struct bufferpool *static_bufferpool;
@@ -102,8 +101,8 @@ static void __start(const char *file, int line) {
 	call.callid = STR("test-call");
 	bencode_buffer_init(&call.buffer);
 	call_memory_arena_set(&call);
-	ml_A = __monologue_create(&call);
-	ml_B = __monologue_create(&call);
+	ml_A = __monologue_create(&call, &call.callid);
+	ml_B = __monologue_create(&call, &call.callid);
 	media_A = call_media_new(&call); // originator
 	media_B = call_media_new(&call); // output destination
 	t_queue_push_tail(&media_A->streams, ps_new(media_A));
@@ -120,6 +119,7 @@ static void __start(const char *file, int line) {
 }
 
 #define transcode(codec) t_queue_push_tail(&flags.codec_transcode, sdup(#codec))
+#define transcode_s(s) t_queue_push_tail(&flags.codec_transcode, sdup(s))
 #define c_accept(codec) t_queue_push_tail(&flags.codec_accept, sdup(#codec))
 #define c_consume(codec) t_queue_push_tail(&flags.codec_consume, sdup(#codec))
 #define c_mask(codec) t_queue_push_tail(&flags.codec_mask, sdup(#codec))
@@ -386,8 +386,8 @@ static void end(void) {
 	g_hash_table_destroy(rtp_seq_ht);
 	t_queue_clear(&media_A->streams);
 	t_queue_clear(&media_B->streams);
-	call_media_free(&media_A);
-	call_media_free(&media_B);
+	call_media_free(media_A);
+	call_media_free(media_B);
 	t_hash_table_destroy(call.tags);
 	t_queue_clear(&call.medias);
 	if (ml_A)
@@ -621,6 +621,49 @@ int main(void) {
 			packet_seq_nf(B, 0, PCMU_payload, 160, 1, 96, AMR_WB_payload_noe);
 			packet_seq(A, 96, AMR_WB_payload_noe, 0, 0, -1, ""); // nothing due to resampling/decoding buffer
 			packet_seq_nf(A, 96, AMR_WB_payload_noe, 320, 1, 0, PCMU_payload);
+			end();
+
+			// forward AMR-WB, answer without fmtp (missing = defaults = octet-align=0)
+			// offer has octet-align=0, answer omits fmtp -> should match
+			start();
+			sdp_pt(0, PCMU, 8000);
+			transcode_s("AMR-WB/16000/1///octet-align=0");
+			offer();
+			expect(A, "0/PCMU/8000");
+			expect(B, "0/PCMU/8000 96/AMR-WB/16000/octet-align=0");
+			sdp_pt(96, AMR-WB, 16000); // answer without fmtp
+			answer();
+			expect(A, "0/PCMU/8000");
+			expect(B, "96/AMR-WB/16000");
+			end();
+
+			// forward AMR-WB, answer without fmtp but offer has octet-align=1
+			// these are incompatible
+			start();
+			sdp_pt(0, PCMU, 8000);
+			transcode(AMR-WB);
+			offer();
+			expect(A, "0/PCMU/8000");
+			expect(B, "0/PCMU/8000 96/AMR-WB/16000/octet-align=1;mode-change-capability=2");
+			sdp_pt(0, PCMU, 8000);
+			sdp_pt(96, AMR-WB, 16000); // answer with PCMU + AMR-WB (no fmtp implies octet-align=0)
+			answer();
+			// AMR-WB should be rejected as incompatible (octet-align=0 != octet-align=1), only PCMU remains
+			expect(A, "0/PCMU/8000");
+			expect(B, "0/PCMU/8000");
+			end();
+
+			// forward AMR-WB, answer with matching octet-align=1
+			start();
+			sdp_pt(0, PCMU, 8000);
+			transcode(AMR-WB);
+			offer();
+			expect(A, "0/PCMU/8000");
+			expect(B, "0/PCMU/8000 96/AMR-WB/16000/octet-align=1;mode-change-capability=2");
+			sdp_pt_fmt(96, AMR-WB, 16000, "octet-align=1");
+			answer();
+			expect(A, "0/PCMU/8000");
+			expect(B, "96/AMR-WB/16000/octet-align=1");
 			end();
 		}
 	}
@@ -1183,7 +1226,7 @@ int main(void) {
 	transcode(GSM);
 	offer();
 	expect(A, "104/SILK/16000 9/G722/8000 0/PCMU/8000 8/PCMA/8000 101/telephone-event/8000 13/CN/8000 118/CN/16000");
-	expect(B, "9/G722/8000 8/PCMA/8000 3/GSM/8000 101/telephone-event/8000 13/CN/8000");
+	expect(B, "104/SILK/16000 9/G722/8000 8/PCMA/8000 3/GSM/8000 101/telephone-event/8000 13/CN/8000 118/CN/16000");
 	sdp_pt(8, PCMA, 8000);
 	sdp_pt(101, telephone-event, 8000);
 	answer();
@@ -1203,7 +1246,7 @@ int main(void) {
 	transcode(GSM);
 	offer();
 	expect(A, "104/SILK/16000 9/G722/8000 0/PCMU/8000 8/PCMA/8000 101/telephone-event/8000 13/CN/8000 118/CN/16000");
-	expect(B, "9/G722/8000 8/PCMA/8000 3/GSM/8000 101/telephone-event/8000 13/CN/8000");
+	expect(B, "104/SILK/16000 9/G722/8000 8/PCMA/8000 3/GSM/8000 101/telephone-event/8000 13/CN/8000 118/CN/16000");
 	sdp_pt(8, PCMA, 8000);
 	sdp_pt(3, GSM, 8000);
 	sdp_pt(101, telephone-event, 8000);
@@ -1229,7 +1272,7 @@ int main(void) {
 	c_consume(PCMU);
 	offer();
 	expect(A, "104/SILK/16000 9/G722/8000 0/PCMU/8000 8/PCMA/8000 101/telephone-event/8000 13/CN/8000 118/CN/16000");
-	expect(B, "9/G722/8000 8/PCMA/8000 101/telephone-event/8000 13/CN/8000");
+	expect(B, "104/SILK/16000 9/G722/8000 8/PCMA/8000 101/telephone-event/8000 13/CN/8000 118/CN/16000");
 	sdp_pt(8, PCMA, 8000);
 	sdp_pt(101, telephone-event, 8000);
 	answer();
@@ -1249,7 +1292,7 @@ int main(void) {
 	transcode(GSM);
 	offer();
 	expect(A, "104/SILK/16000 9/G722/8000 0/PCMU/8000 8/PCMA/8000 101/telephone-event/8000 13/CN/8000 118/CN/16000");
-	expect(B, "9/G722/8000 8/PCMA/8000 3/GSM/8000 101/telephone-event/8000 13/CN/8000");
+	expect(B, "104/SILK/16000 9/G722/8000 8/PCMA/8000 3/GSM/8000 101/telephone-event/8000 13/CN/8000 118/CN/16000");
 	sdp_pt(8, PCMA, 8000);
 	sdp_pt(101, telephone-event, 8000);
 	answer();
@@ -1269,7 +1312,7 @@ int main(void) {
 	transcode(GSM);
 	offer();
 	expect(A, "104/SILK/16000 9/G722/8000 0/PCMU/8000 8/PCMA/8000 101/telephone-event/8000 13/CN/8000 118/CN/16000");
-	expect(B, "9/G722/8000 8/PCMA/8000 3/GSM/8000 101/telephone-event/8000 13/CN/8000");
+	expect(B, "104/SILK/16000 9/G722/8000 8/PCMA/8000 3/GSM/8000 101/telephone-event/8000 13/CN/8000 118/CN/16000");
 	sdp_pt(8, PCMA, 8000);
 	sdp_pt(3, GSM, 8000);
 	sdp_pt(101, telephone-event, 8000);
@@ -1289,7 +1332,7 @@ int main(void) {
 	c_accept(PCMU);
 	offer();
 	expect(A, "104/SILK/16000 9/G722/8000 0/PCMU/8000 8/PCMA/8000 101/telephone-event/8000 13/CN/8000 118/CN/16000");
-	expect(B, "9/G722/8000 0/PCMU/8000 8/PCMA/8000 101/telephone-event/8000 13/CN/8000");
+	expect(B, "104/SILK/16000 9/G722/8000 0/PCMU/8000 8/PCMA/8000 101/telephone-event/8000 13/CN/8000 118/CN/16000");
 	sdp_pt(8, PCMA, 8000);
 	sdp_pt(101, telephone-event, 8000);
 	answer();
@@ -1309,7 +1352,7 @@ int main(void) {
 	transcode(GSM);
 	offer();
 	expect(A, "104/SILK/16000 9/G722/8000 0/PCMU/8000 8/PCMA/8000 101/telephone-event/8000 13/CN/8000 118/CN/16000");
-	expect(B, "9/G722/8000 0/PCMU/8000 8/PCMA/8000 3/GSM/8000 101/telephone-event/8000 13/CN/8000");
+	expect(B, "104/SILK/16000 9/G722/8000 0/PCMU/8000 8/PCMA/8000 3/GSM/8000 101/telephone-event/8000 13/CN/8000 118/CN/16000");
 	sdp_pt(8, PCMA, 8000);
 	sdp_pt(101, telephone-event, 8000);
 	answer();
@@ -1329,7 +1372,7 @@ int main(void) {
 	transcode(GSM);
 	offer();
 	expect(A, "104/SILK/16000 9/G722/8000 0/PCMU/8000 8/PCMA/8000 101/telephone-event/8000 13/CN/8000 118/CN/16000");
-	expect(B, "9/G722/8000 0/PCMU/8000 8/PCMA/8000 3/GSM/8000 101/telephone-event/8000 13/CN/8000");
+	expect(B, "104/SILK/16000 9/G722/8000 0/PCMU/8000 8/PCMA/8000 3/GSM/8000 101/telephone-event/8000 13/CN/8000 118/CN/16000");
 	sdp_pt(8, PCMA, 8000);
 	sdp_pt(3, GSM, 8000);
 	sdp_pt(101, telephone-event, 8000);
@@ -1349,7 +1392,7 @@ int main(void) {
 	c_accept(G722);
 	offer();
 	expect(A, "104/SILK/16000 9/G722/8000 0/PCMU/8000 8/PCMA/8000 101/telephone-event/8000 13/CN/8000 118/CN/16000");
-	expect(B, "9/G722/8000 0/PCMU/8000 8/PCMA/8000 101/telephone-event/8000 13/CN/8000");
+	expect(B, "104/SILK/16000 9/G722/8000 0/PCMU/8000 8/PCMA/8000 101/telephone-event/8000 13/CN/8000 118/CN/16000");
 	sdp_pt(8, PCMA, 8000);
 	sdp_pt(101, telephone-event, 8000);
 	answer();
@@ -1747,6 +1790,45 @@ int main(void) {
 	expect(B, "8/PCMA/8000");
 	end();
 
+	start();
+	sdp_pt_s(96, dummy, 48000);
+	sdp_pt(8, PCMA, 8000);
+	transcode(PCMU);
+	offer();
+	expect(A, "96/dummy/48000/2 8/PCMA/8000");
+	expect(B, "96/dummy/48000/2 8/PCMA/8000 0/PCMU/8000");
+	sdp_pt(8, PCMA, 8000);
+	answer();
+	expect(A, "8/PCMA/8000");
+	expect(B, "8/PCMA/8000");
+	end();
+
+	start();
+	sdp_pt_s(96, dummy, 48000);
+	sdp_pt(8, PCMA, 8000);
+	transcode(PCMU);
+	offer();
+	expect(A, "96/dummy/48000/2 8/PCMA/8000");
+	expect(B, "96/dummy/48000/2 8/PCMA/8000 0/PCMU/8000");
+	sdp_pt(0, PCMU, 8000);
+	answer();
+	expect(A, "8/PCMA/8000");
+	expect(B, "0/PCMU/8000");
+	end();
+
+	start();
+	sdp_pt_s(96, dummy, 48000);
+	sdp_pt(8, PCMA, 8000);
+	transcode(PCMU);
+	offer();
+	expect(A, "96/dummy/48000/2 8/PCMA/8000");
+	expect(B, "96/dummy/48000/2 8/PCMA/8000 0/PCMU/8000");
+	sdp_pt_s(96, dummy, 48000);
+	answer();
+	expect(A, "96/dummy/48000/2");
+	expect(B, "96/dummy/48000/2");
+	end();
+
 	statistics_free();
 	bufferpool_destroy(media_bufferpool);
 	bufferpool_destroy(shm_bufferpool);
@@ -1754,8 +1836,4 @@ int main(void) {
 	bufferpool_cleanup();
 
 	return 0;
-}
-
-int get_local_log_level(unsigned int u) {
-	return 7;
 }

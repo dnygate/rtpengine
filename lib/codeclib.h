@@ -116,12 +116,14 @@ typedef bool format_parse_f(struct rtp_codec_format *, const str *fmtp);
 typedef void format_answer_f(struct rtp_payload_type *, const struct rtp_payload_type *);
 
 
+TYPED_GQUEUE(frame, AVFrame);
+
 
 struct codec_type_s {
 	void (*def_init)(struct codec_def_s *);
 
 	const char *(*decoder_init)(decoder_t *, const str *);
-	int (*decoder_input)(decoder_t *, const str *data, GQueue *);
+	int (*decoder_input)(decoder_t *, const str *data, frame_q *);
 	void (*decoder_close)(decoder_t *);
 
 	const char *(*encoder_init)(encoder_t *, const str *);
@@ -264,7 +266,7 @@ struct dtx_method_s {
 
 	int (*init)(decoder_t *);
 	void (*cleanup)(decoder_t *);
-	int (*do_dtx)(decoder_t *, GQueue *, int);
+	int (*do_dtx)(decoder_t *, frame_q *, int);
 
 	union {
 		struct {
@@ -376,9 +378,13 @@ struct seq_packet_s {
 	int seq;
 };
 struct packet_sequencer_s {
-	GTree *packets;
+	seq_packet_t *packets[128]; // should be 2^n
+	unsigned int a_idx; // start of queue, 0..127
+	unsigned int a_seq; // seq of head of queue
+	unsigned int n_pks; // number of packets
+	unsigned int a_nxt; // index of next closest
+	void (*free_func)(seq_packet_t *);
 	unsigned int lost_count;
-	int seq; // next expected
 	unsigned int ext_seq; // last received
 	int roc; // rollover counter XXX duplicate with SRTP encryption context
 };
@@ -391,6 +397,8 @@ extern const GQueue * const codec_supplemental_codecs;
 extern void (*codeclib_thread_init)(void);
 extern void (*codeclib_thread_cleanup)(void);
 extern void (*codeclib_thread_loop)(void);
+
+void *dlsym_assert(void *handle, const char *sym, const char *fn);
 
 void codeclib_init(int);
 void codeclib_free(void);
@@ -435,11 +443,10 @@ int encoder_input_fifo(encoder_t *enc, AVFrame *frame,
 		int (*callback)(encoder_t *, void *u1, void *u2), void *u1, void *u2);
 
 
-void __packet_sequencer_init(packet_sequencer_t *ps, GDestroyNotify);
-INLINE void packet_sequencer_init(packet_sequencer_t *ps, GDestroyNotify);
+void packet_sequencer_init(packet_sequencer_t *ps, void (*)(seq_packet_t *));
 void packet_sequencer_destroy(packet_sequencer_t *ps);
 void *packet_sequencer_next_packet(packet_sequencer_t *ps);
-int packet_sequencer_next_ok(packet_sequencer_t *ps);
+bool packet_sequencer_next_ok(packet_sequencer_t *ps);
 void *packet_sequencer_force_next_packet(packet_sequencer_t *ps);
 int packet_sequencer_insert(packet_sequencer_t *ps, seq_packet_t *);
 
@@ -454,6 +461,43 @@ void frame_fill_dtmf_samples(enum AVSampleFormat fmt, void *samples, unsigned in
 
 #ifdef HAVE_CODEC_CHAIN
 
+typedef struct {
+	unsigned int ctx_idx;
+
+	unsigned int runs;
+	unsigned int slots;
+	uint64_t run_wait;
+	uint64_t writers_wait;
+	uint64_t compute_wait;
+	uint64_t readers_wait;
+
+	unsigned int run_busy;
+	unsigned int write_busy;
+	unsigned int slots_full;
+	unsigned int buf_full;
+
+	uint64_t ready_wait;
+	uint64_t callbacks_preempt;
+	uint64_t callbacks_fetch;
+	uint64_t callbacks_run;
+	uint64_t loop_barrier;
+} codec_cc_context_stats;
+
+TYPED_GQUEUE(codec_cc_context, codec_cc_context_stats);
+
+typedef struct {
+	char name[32];
+
+	unsigned int async_busy;
+	unsigned int async_blocked;
+	unsigned int async_retry;
+
+	codec_cc_context_q contexts;
+} codec_cc_stats_entry;
+
+TYPED_GQUEUE(codec_cc_stats, codec_cc_stats_entry);
+
+
 extern codec_cc_t *(*codec_cc_new)(codec_def_t *src, format_t *src_format, codec_def_t *dst,
 		format_t *dst_format, int bitrate, int ptime,
 		void *(*init_async)(void *, void *, void *),
@@ -462,6 +506,8 @@ void cc_init_chain(codec_def_t *src, format_t *src_format, codec_def_t *dst,
 		format_t *dst_format);
 void codec_cc_stop(codec_cc_t *);
 void codec_cc_free(codec_cc_t **);
+
+codec_cc_stats_q codec_cc_stats(void);
 
 #else
 
@@ -483,11 +529,6 @@ AVPacket *codec_cc_input_data(codec_cc_t *c, const str *data, unsigned long ts, 
 
 
 // `ps` must be zero allocated
-INLINE void packet_sequencer_init(packet_sequencer_t *ps, GDestroyNotify n) {
-	if (ps->packets)
-		return;
-	__packet_sequencer_init(ps, n);
-}
 INLINE int format_eq(const format_t *a, const format_t *b) {
 	if (G_UNLIKELY(a->clockrate != b->clockrate))
 		return 0;

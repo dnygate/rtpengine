@@ -6,7 +6,7 @@
 #include <sys/time.h>
 #include "types.h"
 #include "main.h"
-#include "log.h"
+#include "log_r.h"
 #include "tag.h"
 #include "recaux.h"
 #include "output.h"
@@ -382,6 +382,8 @@ void db_do_stream(metafile_t *mf, output_t *op, stream_t *stream, unsigned long 
 	if (!db_wanted())
 		return;
 	if (mf->db_id == 0)
+		return;
+	if (!op)
 		return;
 	if (op->db_id > 0)
 		return;

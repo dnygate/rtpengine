@@ -7,11 +7,10 @@
 #include "str.h"
 #include "call.h"
 #include "helpers.h"
-#include "log.h"
+#include "log_d.h"
 #include "obj.h"
 #include "stun.h"
 #include "poller.h"
-#include "log_funcs.h"
 #include "timerthread.h"
 #include "call_interfaces.h"
 
@@ -285,7 +284,7 @@ static struct ice_candidate_pair *__pair_candidate(stream_fd *sfd, struct ice_ag
 	pair->agent = ag;
 	pair->remote_candidate = cand;
 	pair->local_intf = sfd->local_intf;
-	pair->sfd = sfd;
+	pair->sfd = obj_get(sfd);
 	if (cand->component_id != 1)
 		PAIR_SET(pair, FROZEN);
 	__do_ice_pair_priority(pair);
@@ -295,10 +294,12 @@ static struct ice_candidate_pair *__pair_candidate(stream_fd *sfd, struct ice_ag
 	t_hash_table_insert(ag->pair_hash, pair, pair);
 	rtpe_g_tree_insert_coll(ag->all_pairs, pair, pair, __tree_coll_callback);
 
-	ilogs(ice, LOG_DEBUG, "Created candidate pair "PAIR_FORMAT" between %s and %s%s%s, type %s", PAIR_FMT(pair),
+	ilogs(ice, LOG_DEBUG, "Created candidate pair " PAIR_FORMAT
+				" between %s and %s%s%s, type %s prio %lu/%" PRIu64, PAIR_FMT(pair),
 			sockaddr_print_buf(&sfd->socket.local.address),
 			FMT_M(endpoint_print_buf(&cand->endpoint)),
-			ice_candidate_type_str(cand->type));
+			ice_candidate_type_str(cand->type),
+			cand->priority, pair->pair_priority);
 
 	return pair;
 }
@@ -637,6 +638,7 @@ void ice_candidates_free(candidate_q *q) {
 	t_queue_clear_full(q, ice_candidate_free);
 }
 static void ice_candidate_pair_free(struct ice_candidate_pair *p) {
+	obj_release(p->sfd);
 	g_free(p);
 }
 static void ice_candidate_pairs_free(candidate_pair_q *q) {
@@ -758,6 +760,9 @@ static void __do_ice_check(struct ice_candidate_pair *pair) {
 		return;
 
 	if (!ag->pwd[0].s)
+		return;
+
+	if (!sfd->socket.family)
 		return;
 
 	prio = ice_priority(ICT_PRFLX, pair->local_intf->unique_id,
@@ -893,7 +898,7 @@ static void __do_ice_checks(struct ice_agent *ag) {
 
 		/* skip dead streams */
 		sfd = pair->sfd;
-		if (!sfd || !sfd->stream || !sfd->stream->selected_sfd)
+		if (!sfd || !sfd->stream || !sfd->stream->selected_sfd || !sfd->socket.family)
 			continue;
 		if (PAIR_ISSET(pair, FAILED))
 			continue;
@@ -1237,6 +1242,7 @@ static int __check_valid(struct ice_agent *ag) {
 			if (sfd->local_intf != pair->local_intf)
 				continue;
 			ps->selected_sfd = sfd;
+			sfd->confirmed = true;
 			if (ps->component == 1)
 				ilogs(ice, LOG_INFO, "ICE negotiated: local interface %s",
 						sockaddr_print_buf(&pair->local_intf->spec->local_address.addr));
@@ -1269,9 +1275,10 @@ int ice_request(stream_fd *sfd, const endpoint_t *src,
 	struct ice_candidate_pair *pair;
 	int ret;
 
-	ilogs(ice, LOG_DEBUG, "Received ICE/STUN request from %s on %s",
-			endpoint_print_buf(src),
-			endpoint_print_buf(&sfd->socket.local));
+	ilogs(ice, LOG_DEBUG, "Received ICE/STUN request from %s%s%s on %s (prio %" PRIu32 ")",
+			FMT_M(endpoint_print_buf(src)),
+			endpoint_print_buf(&sfd->socket.local),
+			attrs->priority);
 
 	ag = media->ice_agent;
 	if (!ag)

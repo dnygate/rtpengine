@@ -7,13 +7,13 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
-#include "log.h"
+#include "log_r.h"
 #include "db.h"
 #include "main.h"
 #include "recaux.h"
 #include "notify.h"
 #include "resample.h"
-#include "fix_frame_channel_layout.h"
+#include "fix_frame_channel_layout.compat"
 #include "s3.h"
 #include "gcs.h"
 
@@ -261,13 +261,13 @@ static output_t *output_new(const char *path, const metafile_t *mf, const char *
 			case '{':
 				// find matching end '}'
 				p++;
-				end = strchr(p, '}');
-				if (!end) {
+				const char *cend = strchr(p, '}');
+				if (!cend) {
 					ilog(LOG_ERR, "Missing ending brace '}' in file name pattern");
 					break;
 				}
-				str fmt = STR_LEN((char *) p, end - p);
-				p = end; // skip over {...}
+				str fmt = STR_LEN((char *) p, cend - p);
+				p = cend; // skip over {...}
 				output_append_str_from_ht(f, mf->metadata_parsed, &fmt);
 				break;
 			default:
@@ -431,18 +431,7 @@ static const char *output_setup(output_t *output, const format_t *requested_form
 		return "failed to alloc output stream";
 	output->avst->time_base = output->encoder->avc.avcctx->time_base;
 
-#if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(57, 0, 0)
-	// move the avcctx to avst as we already have an initialized avcctx
-	if (output->avst->codec) {
-		avcodec_close(output->avst->codec);
-		avcodec_free_context(&output->avst->codec);
-	}
-	output->avst->codec = output->encoder->avc.avcctx;
-#endif
-
-#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(57, 26, 0) // exact version? present in 57.56
 	avcodec_parameters_from_context(output->avst->codecpar, output->encoder->avc.avcctx);
-#endif
 
 	if (!(output_storage & OUTPUT_STORAGE_MEMORY)) {
 		const char *err = output_open_file(output);
@@ -648,11 +637,6 @@ static bool output_shutdown(output_t *output) {
 		av_freep(&output->avioctx);
 	}
 	avformat_free_context(output->fmtctx);
-
-#if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(57, 0, 0)
-	// avoid double free - avcctx already freed
-	output->encoder->avc.avcctx = NULL;
-#endif
 
 	encoder_close(output->encoder);
 

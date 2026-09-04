@@ -138,6 +138,10 @@ struct sdp_ng_flags {
 		MEO_BKW,
 		MEO_BOTH,
 	} media_echo:3;
+	struct {
+		uint32_t egress_to_offerer;	/* forced SSRC for RTP sent towards the offerer, 0 = unset */
+		uint32_t egress_to_answerer;	/* forced SSRC for RTP sent towards the answerer, 0 = unset */
+	} ssrc_force;
 	enum {
 		ALL_NONE = 0,
 		ALL_ALL,
@@ -235,6 +239,7 @@ RTPE_NG_FLAGS_STR_CASE_HT_PARAMS
 		     rtcp_mirror:1,
 		     mix:1,
 		     trickle_ice:1,
+		     ice2:1,
 	             no_rtcp_attr:1,
 	             no_tls_id:1,
 	             full_rtcp_attr:1,
@@ -244,7 +249,6 @@ RTPE_NG_FLAGS_STR_CASE_HT_PARAMS
 	             strict_source:1,
 	             media_handover:1,
 	             dtls_passive:1,
-	             dtls_reverse_passive:1,
 	             osrtp_accept_legacy:1,
 	             osrtp_accept_rfc:1,
 	             osrtp_offer:1,
@@ -313,6 +317,7 @@ RTPE_NG_FLAGS_STR_CASE_HT_PARAMS
 		     bidirectional:1,
 		     unsubscribe:1,
 		     fatal:1,
+		     fast:1,
 		     new_branch:1,
 		     provisional:1,
 		     /* to_tag is used especially by delete handling */

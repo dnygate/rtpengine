@@ -100,6 +100,51 @@ static const char *ng_sdes_option(str *s, unsigned int idx, helper_arg arg) {
 	return NULL;
 }
 
+/* Parses an SSRC value given either as an integer or as a decimal or
+ * `0x`-prefixed hexadecimal string. Returns 0 (meaning unset) for a zero
+ * value or if the value is invalid. */
+static uint32_t call_ng_parse_ssrc(const ng_parser_t *parser, parser_arg value) {
+	str s;
+	long long v;
+
+	if (parser->get_str(value, &s)) {
+		char buf[32];
+		size_t n = MIN(s.len, sizeof(buf) - 1);
+		memcpy(buf, s.s, n);
+		buf[n] = '\0';
+		char *end = buf;
+		v = strtoll(buf, &end, 0);
+		if (end == buf || *end != '\0')
+			v = -1;
+	}
+	else
+		v = parser->get_int_str(value, -1);
+
+	if (v < 0 || v > UINT32_MAX) {
+		ilog(LOG_WARN, "Invalid SSRC value given, ignoring");
+		return 0;
+	}
+	return v;
+}
+
+static const char *call_ng_flags_ssrc(const ng_parser_t *parser, str *key, parser_arg value, helper_arg arg) {
+	sdp_ng_flags *out = arg.flags;
+	switch (__csh_lookup(key)) {
+		case CSH_LOOKUP("egress-to-offerer"):
+		case CSH_LOOKUP("egress to offerer"):
+			out->ssrc_force.egress_to_offerer = call_ng_parse_ssrc(parser, value);
+			break;
+		case CSH_LOOKUP("egress-to-answerer"):
+		case CSH_LOOKUP("egress to answerer"):
+			out->ssrc_force.egress_to_answerer = call_ng_parse_ssrc(parser, value);
+			break;
+		default:
+			ilog(LOG_WARN, "Unknown 'SSRC' flag encountered: '" STR_FORMAT "'",
+					STR_FMT(key));
+	}
+	return NULL;
+}
+
 static const char *ng_osrtp_option(str *s, unsigned int idx, helper_arg arg) {
 	sdp_ng_flags *out = arg.flags;
 
@@ -446,6 +491,34 @@ static const char *call_ng_flags_bundle(str *s, unsigned int idx, helper_arg arg
 	return NULL;
 }
 
+static const char *call_ng_flags_dtls(str *s, unsigned int idx, sdp_ng_flags *out) {
+	switch (__csh_lookup(s)) {
+		case CSH_LOOKUP("passive"):
+			if (out->opmode == OP_ANSWER)
+				ilog(LOG_NOTICE, "Ignoring DTLS=passive flag in answer as it is too late");
+			else
+				out->dtls_passive = true;
+			break;
+		case CSH_LOOKUP("active"):
+			if (out->opmode == OP_ANSWER)
+				ilog(LOG_NOTICE, "Ignoring DTLS=active flag in answer as it is too late");
+			else
+				out->dtls_passive = false;
+			break;
+		case CSH_LOOKUP("no"):
+		case CSH_LOOKUP("off"):
+		case CSH_LOOKUP("disabled"):
+		case CSH_LOOKUP("disable"):
+			out->dtls_off = true;
+			break;
+		default:
+			ilog(LOG_WARN, "Unknown 'DTLS' flag encountered: '" STR_FORMAT "'",
+					STR_FMT(s));
+	}
+
+	return NULL;
+}
+
 static const char *call_ng_flags_moh(const ng_parser_t *parser, str *key, parser_arg value, helper_arg arg) {
 	sdp_ng_flags *out = arg.flags;
 	switch (__csh_lookup(key)) {
@@ -749,6 +822,9 @@ const char *call_ng_flags_flags(str *s, unsigned int idx, helper_arg arg) {
 			break;
 		case CSH_LOOKUP("fatal"):
 			out->fatal = true;
+			break;
+		case CSH_LOOKUP("fast"):
+			out->fast = true;
 			break;
 		case CSH_LOOKUP("fragment"):
 			out->fragment = true;
@@ -1076,7 +1152,6 @@ void call_ng_flags_init(sdp_ng_flags *out, enum ng_opmode opmode) {
 
 	out->trust_address = trust_address_def;
 	out->dtls_passive = dtls_passive_def;
-	out->dtls_reverse_passive = dtls_passive_def;
 	out->el_option = rtpe_config.endpoint_learning;
 	out->tos = 256;
 	out->delay_buffer = -1;
@@ -1397,6 +1472,65 @@ static const char *call_ng_tags_iter(const ng_parser_t *parser, parser_arg item,
 	return NULL;
 }
 
+const char *call_ng_flags_ice(str *s, unsigned int idx, sdp_ng_flags *out) {
+	switch (__csh_lookup(s)) {
+		case CSH_LOOKUP("remove"):
+			out->ice_option = ICE_REMOVE;
+			break;
+		case CSH_LOOKUP("force"):
+			out->ice_option = ICE_FORCE;
+			break;
+		case CSH_LOOKUP("default"):
+			out->ice_option = ICE_DEFAULT;
+			break;
+		case CSH_LOOKUP("optional"):
+			out->ice_option = ICE_OPTIONAL;
+			break;
+		case CSH_LOOKUP("force_relay"):
+		case CSH_LOOKUP("force-relay"):
+		case CSH_LOOKUP("force relay"):
+			out->ice_option = ICE_FORCE_RELAY;
+			break;
+		case CSH_LOOKUP("lite-no"):
+		case CSH_LOOKUP("lite-off"):
+		case CSH_LOOKUP("lite-none"):
+		case CSH_LOOKUP("no-lite"):
+			out->ice_lite_option = ICE_LITE_OFF;
+			break;
+		case CSH_LOOKUP("lite"):
+		case CSH_LOOKUP("lite-fw"):
+		case CSH_LOOKUP("lite-fwd"):
+		case CSH_LOOKUP("lite-forward"):
+		case CSH_LOOKUP("lite-offer"):
+			out->ice_lite_option = ICE_LITE_FWD;
+			break;
+		case CSH_LOOKUP("lite-backward"):
+		case CSH_LOOKUP("lite-backwards"):
+		case CSH_LOOKUP("lite-reverse"):
+		case CSH_LOOKUP("lite-answer"):
+		case CSH_LOOKUP("lite-back"):
+		case CSH_LOOKUP("lite-bkw"):
+		case CSH_LOOKUP("lite-bk"):
+			out->ice_lite_option = ICE_LITE_BKW;
+			break;
+		case CSH_LOOKUP("lite-both"):
+			out->ice_lite_option = ICE_LITE_BOTH;
+			break;
+		case CSH_LOOKUP("trickle"):
+			out->trickle_ice = true;
+			break;
+		case CSH_LOOKUP("ice2"):
+		case CSH_LOOKUP("ICE2"):
+			out->ice2 = true;
+			break;
+		default:
+			ilog(LOG_WARN, "Unknown 'ICE' flag encountered: '" STR_FORMAT "'",
+					STR_FMT(s));
+	}
+
+	return NULL;
+}
+
 const char *call_ng_main_flags(const ng_parser_t *parser, str *key, parser_arg value, helper_arg arg) {
 	str s = STR_NULL;
 	sdp_ng_flags *out = arg.flags;
@@ -1545,45 +1679,14 @@ const char *call_ng_main_flags(const ng_parser_t *parser, str *key, parser_arg v
 			break;
 		case CSH_LOOKUP("DTLS"):
 		case CSH_LOOKUP("dtls"):
-			switch (__csh_lookup_n(1, &s)) {
-				case CSH_LOOKUP_N(1, "passive"):
-					out->dtls_passive = true;
-					break;
-				case CSH_LOOKUP_N(1, "active"):
-					out->dtls_passive = 0;
-					break;
-				case CSH_LOOKUP_N(1, "no"):
-				case CSH_LOOKUP_N(1, "off"):
-				case CSH_LOOKUP_N(1, "disabled"):
-				case CSH_LOOKUP_N(1, "disable"):
-					out->dtls_off = true;
-					break;
-				default:
-					ilog(LOG_WARN, "Unknown 'DTLS' flag encountered: '" STR_FORMAT "'",
-							STR_FMT(&s));
-			}
-			break;
+		case CSH_LOOKUP("DTLS-reverse"):
+		case CSH_LOOKUP("dtls-reverse"):
+			return call_ng_flags_str_list(parser, value, call_ng_flags_dtls, out);
 		case CSH_LOOKUP("DTLS fingerprint"):
 		case CSH_LOOKUP("DTLS-fingerprint"):
 		case CSH_LOOKUP("dtls fingerprint"):
 		case CSH_LOOKUP("dtls-fingerprint"):
 			out->dtls_fingerprint = s;
-			break;
-		case CSH_LOOKUP("DTLS-reverse"):
-		case CSH_LOOKUP("dtls-reverse"):
-		case CSH_LOOKUP("DTLS reverse"):
-		case CSH_LOOKUP("dtls reverse"):
-			switch (__csh_lookup_n(1, &s)) {
-				case CSH_LOOKUP_N(1, "passive"):
-					out->dtls_reverse_passive = true;
-					break;
-				case CSH_LOOKUP_N(1, "active"):
-					out->dtls_reverse_passive = 0;
-					break;
-				default:
-					ilog(LOG_WARN, "Unknown 'DTLS-reverse' flag encountered: '" STR_FORMAT "'",
-							STR_FMT(&s));
-			}
 			break;
 		case CSH_LOOKUP("DTMF-delay"):
 		case CSH_LOOKUP("DTMF delay"):
@@ -1667,29 +1770,7 @@ const char *call_ng_main_flags(const ng_parser_t *parser, str *key, parser_arg v
 			break;
 		case CSH_LOOKUP("ICE"):
 		case CSH_LOOKUP("ice"):
-			switch (__csh_lookup_n(1, &s)) {
-				case CSH_LOOKUP_N(1, "remove"):
-					out->ice_option = ICE_REMOVE;
-					break;
-				case CSH_LOOKUP_N(1, "force"):
-					out->ice_option = ICE_FORCE;
-					break;
-				case CSH_LOOKUP_N(1, "default"):
-					out->ice_option = ICE_DEFAULT;
-					break;
-				case CSH_LOOKUP_N(1, "optional"):
-					out->ice_option = ICE_OPTIONAL;
-					break;
-				case CSH_LOOKUP_N(1, "force_relay"):
-				case CSH_LOOKUP_N(1, "force-relay"):
-				case CSH_LOOKUP_N(1, "force relay"):
-					out->ice_option = ICE_FORCE_RELAY;
-					break;
-				default:
-					ilog(LOG_WARN, "Unknown 'ICE' flag encountered: '" STR_FORMAT "'",
-							STR_FMT(&s));
-			}
-			break;
+			return call_ng_flags_str_list(parser, value, call_ng_flags_ice, out);
 		case CSH_LOOKUP("ICE-lite"):
 		case CSH_LOOKUP("ice-lite"):
 		case CSH_LOOKUP("ICE lite"):
@@ -1783,6 +1864,9 @@ const char *call_ng_main_flags(const ng_parser_t *parser, str *key, parser_arg v
 		case CSH_LOOKUP("OSRTP"):
 		case CSH_LOOKUP("osrtp"):
 			return call_ng_flags_str_list(parser, value, ng_osrtp_option, out);
+		case CSH_LOOKUP("SSRC"):
+		case CSH_LOOKUP("ssrc"):
+			return parser->dict_iter(parser, value, call_ng_flags_ssrc, out);
 		case CSH_LOOKUP("outbound-peer"):
 		case CSH_LOOKUP("outbound peer"):
 			call_ng_flags_peer_address(&s, &out->direction[1], "Outbound");

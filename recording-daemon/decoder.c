@@ -9,7 +9,7 @@
 #include <stdint.h>
 #include <libavutil/opt.h>
 #include "types.h"
-#include "log.h"
+#include "log_r.h"
 #include "str.h"
 #include "output.h"
 #include "mix.h"
@@ -24,7 +24,7 @@
 
 // does not initialise the contained `sink`
 decode_t *decoder_new(const char *payload_str, const char *format, int ptime) {
-	char *slash = strchr(payload_str, '/');
+	const char *slash = strchr(payload_str, '/');
 	if (!slash) {
 		ilog(LOG_WARN, "Invalid payload format: %s", payload_str);
 		return NULL;

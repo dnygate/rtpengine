@@ -1,6 +1,6 @@
 #include "codeclib.h"
 #include "str.h"
-#include "fix_frame_channel_layout.h"
+#include "fix_frame_channel_layout.compat"
 #include "main.h"
 #include <assert.h>
 
@@ -147,8 +147,4 @@ int main(void) {
 			12200);
 
 	return 0;
-}
-
-int get_local_log_level(unsigned int u) {
-	return -1;
 }

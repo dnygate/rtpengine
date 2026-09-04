@@ -14,7 +14,7 @@
 
 #include "poller.h"
 #include "helpers.h"
-#include "log.h"
+#include "log_d.h"
 #include "kernel.h"
 #include "control_tcp.h"
 #include "streambuf.h"
@@ -25,7 +25,6 @@
 #include "rtp.h"
 #include "call_interfaces.h"
 #include "ice.h"
-#include "log_funcs.h"
 #include "rtplib.h"
 #include "cdr.h"
 #include "ssrc.h"
@@ -444,6 +443,7 @@ void kill_calls_timer(GSList *list, const char *url) {
 	call_t *ca;
 	struct call_monologue *cm;
 	char *url_prefix = NULL, *url_suffix = NULL;
+	const char *needle;
 	struct xmlrpc_helper *xh = NULL;
 	char url_buf[128];
 
@@ -454,10 +454,10 @@ void kill_calls_timer(GSList *list, const char *url) {
 	if (url) {
 		xh = g_new(__typeof(*xh), 1);
 		url_prefix = NULL;
-		url_suffix = strstr(url, "%%");
-		if (url_suffix) {
-			url_prefix = strndup(url, url_suffix - url);
-			url_suffix = strdup(url_suffix + 2);
+		needle = strstr(url, "%%");
+		if (needle) {
+			url_prefix = strndup(url, needle - url);
+			url_suffix = strdup(needle + 2);
 		}
 		else
 			url_suffix = strdup(url);
@@ -743,11 +743,11 @@ static struct call_media *call_get_media(struct call_monologue *ml, const str *t
 		t_ptr_array_set_size(ml->medias, want_index);
 
 	if (ml->medias->pdata[arr_index]) {
-		__C_DBG("found existing call_media for stream #%u", want_index);
+		dbg_int("found existing call_media for stream #%u", want_index);
 		return ml->medias->pdata[arr_index];
 	}
 
-	__C_DBG("allocating new call_media for stream #%u", want_index);
+	dbg_int("allocating new call_media for stream #%u", want_index);
 	call = ml->call;
 	med = call_media_new(call);
 	med->monologue = ml;
@@ -820,7 +820,7 @@ static struct endpoint_map *__hunt_endpoint_map(struct call_media *media, unsign
 		if ((em->wildcard || always_reuse) && em->num_ports >= num_ports
 				&& em->intf_sfds.length >= want_interfaces)
 		{
-			__C_DBG("found a wildcard endpoint map%s", ep ? " and filling it in" : "");
+			dbg_int("found a wildcard endpoint map%s", ep ? " and filling it in" : "");
 			if (ep) {
 				em->endpoint = *ep;
 				em->wildcard = 0;
@@ -874,7 +874,7 @@ static struct endpoint_map *__get_endpoint_map(struct call_media *media, unsigne
 		}
 	}
 
-	__C_DBG("allocating new %sendpoint map", ep ? "" : "wildcard ");
+	dbg_int("allocating new %sendpoint map", ep ? "" : "wildcard ");
 	em = uid_alloc(&media->call->endpoint_maps);
 	if (ep)
 		em->endpoint = *ep;
@@ -907,7 +907,7 @@ static void __assign_stream_fds(struct call_media *media, sfd_intf_list_q *intf_
 		// use opaque pointer to detect changes
 		void *old_selected_sfd = ps->selected_sfd;
 
-		t_queue_clear(&ps->sfds);
+		t_queue_clear_full(&ps->sfds, stream_fd_dec);
 		bool sfd_found = false;
 		stream_fd *intf_sfd = NULL;
 
@@ -994,7 +994,7 @@ static int __num_media_streams(struct call_media *media, unsigned int num_ports)
 	if (num_ports < 2)
 		num_ports = 2;
 
-	__C_DBG("allocating %i new packet_streams", num_ports - media->streams.length);
+	dbg_int("allocating %i new packet_streams", num_ports - media->streams.length);
 	while (media->streams.length < num_ports) {
 		stream = __packet_stream_new(call);
 		stream->media = media;
@@ -1037,9 +1037,14 @@ static void __fill_stream(struct packet_stream *ps, const struct endpoint *epp, 
 				&& ep.address.family != ps->selected_sfd->socket.family)
 		{
 			if (ep.address.family && !is_trickle_ice_address(&ep))
+			{
+				const char *socket_family = ps->selected_sfd->socket.family
+								? ps->selected_sfd->socket.family->name : "none";
+
 				ilog(LOG_WARN, "Ignoring updated remote endpoint %s%s%s as the local "
 						"socket is %s", FMT_M(endpoint_print_buf(&ep)),
-						ps->selected_sfd->socket.family->name);
+						socket_family);
+			}
 			return;
 		}
 
@@ -1092,7 +1097,7 @@ static void call_stream_crypto_reset(struct packet_stream *ps) {
 		mutex_unlock(&media->ssrc_hash_in.lock);
 
 		mutex_lock(&media->ssrc_hash_out.lock);
-		for (GList *l = media->ssrc_hash_in.nq.head; l; l = l->next) {
+		for (GList *l = media->ssrc_hash_out.nq.head; l; l = l->next) {
 			struct ssrc_entry_call *se = l->data;
 			atomic_set_na(&se->stats->ext_seq, 0);
 		}
@@ -1166,8 +1171,7 @@ bool __init_stream(struct packet_stream *ps) {
 
 	if (MEDIA_ISSET(media, DTLS)) {
 		dtls_conn = dtls_ptr(ps->selected_sfd);
-		if (dtls_conn)
-			dtls_active = dtls_is_active(dtls_conn);
+		dtls_active = dtls_is_active(dtls_conn);
 	}
 	else
 		dtls_shutdown(ps);
@@ -1192,11 +1196,12 @@ bool __init_stream(struct packet_stream *ps) {
 
 	if (MEDIA_ISSET(media, DTLS) && !PS_ISSET(ps, FALLBACK_RTCP)) {
 		// we try to retain our role if possible, but must handle a role switch
-		if ((dtls_active && !MEDIA_ISSET(media, SETUP_ACTIVE))
-				|| (!dtls_active && !MEDIA_ISSET(media, SETUP_PASSIVE)))
-			dtls_active = -1;
 		if (dtls_active == -1)
-			dtls_active = (PS_ISSET(ps, FILLED) && MEDIA_ISSET(media, SETUP_ACTIVE));
+			dtls_active = !MEDIA_ISSET(media, SETUP_PASSIVE);
+		else if (dtls_active == 0 && !MEDIA_ISSET(media, SETUP_PASSIVE))
+			dtls_active = 1;
+		else if (dtls_active == 1 && !MEDIA_ISSET(media, SETUP_ACTIVE))
+			dtls_active = 0;
 		dtls_connection_init(&ps->ice_dtls, ps, dtls_active, call->dtls_cert);
 		for (__auto_type l = ps->sfds.head; l; l = l->next) {
 			stream_fd *sfd = l->data;
@@ -1275,7 +1280,7 @@ static bool __init_streams(struct call_media *A, const struct stream_params *sp,
 {
 	unsigned int port_off = 0;
 
-	__C_DBG("Stream set flags media %u", A->index);
+	dbg_int("Stream set flags media %u", A->index);
 
 	for (__auto_type l = A->streams.head; l; l = l->next) {
 		__auto_type a = l->data;
@@ -1293,7 +1298,6 @@ static bool __init_streams(struct call_media *A, const struct stream_params *sp,
 				ilog(LOG_WARN, "Both strict-source and media-handover are set, "
 						"which are mutually exclusive");
 		}
-		bf_copy_same(&a->ps_flags, &A->media_flags, SHARED_FLAG_ICE);
 
 		/* RTCP */
 		if (!MEDIA_ISSET(A, RTCP_MUX))
@@ -1333,7 +1337,6 @@ static bool __init_streams(struct call_media *A, const struct stream_params *sp,
 				ilog(LOG_WARN, "Both strict-source and media-handover are set, "
 						"which are mutually exclusive");
 		}
-		bf_copy_same(&a->ps_flags, &A->media_flags, SHARED_FLAG_ICE);
 
 		PS_CLEAR(a, ZERO_ADDR);
 
@@ -1356,7 +1359,7 @@ static bool __streams_set_sinks(struct call_media *A, struct call_media *B,
 	__auto_type la = A->streams.head;
 	__auto_type lb = B->streams.head;
 
-	__C_DBG("Sink init media %u -> %u", A->index, B->index);
+	dbg_int("Sink init media %u -> %u", A->index, B->index);
 
 	while (la) {
 		if (!lb)
@@ -1503,6 +1506,8 @@ static void __ice_offer(const sdp_ng_flags *flags, struct call_media *this,
 
 		if (flags->trickle_ice)
 			MEDIA_SET(this, TRICKLE_ICE);
+		if (flags->ice2)
+			MEDIA_SET(this, ICE2);
 	}
 	else if (flags->opmode == OP_SUBSCRIBE_REQ) {
 		// leave source media (`other`) alone
@@ -1521,6 +1526,8 @@ static void __ice_offer(const sdp_ng_flags *flags, struct call_media *this,
 
 		if (flags->trickle_ice)
 			MEDIA_SET(this, TRICKLE_ICE);
+		if (flags->ice2)
+			MEDIA_SET(this, ICE2);
 	}
 
 	/* determine roles (even if we don't actually do ICE) */
@@ -1659,8 +1666,6 @@ static void __generate_crypto(const sdp_ng_flags *flags, struct call_media *this
 		MEDIA_SET(this, SETUP_ACTIVE);
 	}
 	else {
-		if (flags->dtls_passive && MEDIA_ISSET(this, SETUP_PASSIVE))
-			MEDIA_CLEAR(this, SETUP_ACTIVE);
 		/* if we can be active, we will, otherwise we'll be passive */
 		if (MEDIA_ISSET(this, SETUP_ACTIVE))
 			MEDIA_CLEAR(this, SETUP_PASSIVE);
@@ -2200,17 +2205,21 @@ static void __dtls_logic(const sdp_ng_flags *flags,
 		MEDIA_CLEAR(other_media, SETUP_PASSIVE);
 	}
 
-	/* Special case: if this is an offer and actpass is being offered (as it should),
-	 * we would normally choose to be active. However, if this is a reinvite and we
-	 * were passive previously, we should retain this role. */
+	// resolve setup=actpass for offers
 	if ((flags->opmode == OP_OFFER || flags->opmode == OP_PUBLISH)
-			&& MEDIA_ARESET2(other_media, SETUP_ACTIVE, SETUP_PASSIVE)
-			&& (tmp & (MEDIA_FLAG_SETUP_ACTIVE | MEDIA_FLAG_SETUP_PASSIVE))
+			&& MEDIA_ARESET2(other_media, SETUP_ACTIVE, SETUP_PASSIVE))
+	{
+		// if passive mode is requested, honour it
+		if (flags->dtls_passive)
+			MEDIA_CLEAR(other_media, SETUP_ACTIVE);
+		// if we were previously passive, retain that role
+		else if ((tmp & (MEDIA_FLAG_SETUP_ACTIVE | MEDIA_FLAG_SETUP_PASSIVE))
 			== MEDIA_FLAG_SETUP_PASSIVE)
-		MEDIA_CLEAR(other_media, SETUP_ACTIVE);
-	/* if passive mode is requested, honour it if we can */
-	if (flags->dtls_reverse_passive && MEDIA_ISSET(other_media, SETUP_PASSIVE))
-		MEDIA_CLEAR(other_media, SETUP_ACTIVE);
+			MEDIA_CLEAR(other_media, SETUP_ACTIVE);
+		// in all other cases: we are active
+		else
+			MEDIA_CLEAR(other_media, SETUP_PASSIVE);
+	}
 
 	// restart DTLS?
 	if (memcmp(&other_media->fingerprint, &sp->fingerprint, sizeof(sp->fingerprint))) {
@@ -2269,8 +2278,12 @@ static void media_loop_protect(struct stream_params *sp, struct call_media *medi
 	intf_addr.addr = sp->rtp_endpoint.address;
 	if (!intf_addr.addr.family) // dummy/empty address
 		return;
-	if (!is_local_endpoint(&intf_addr, sp->rtp_endpoint.port))
+	if (!is_local_endpoint(&intf_addr, sp->rtp_endpoint.port)) {
+		if (MEDIA_ISSET(media, LOOP_CHECK))
+			ilog(LOG_DEBUG, "Remote endpoint is no longer local, disabling loop checking");
+		MEDIA_CLEAR(media, LOOP_CHECK);
 		return;
+	}
 
 	ilog(LOG_DEBUG, "Detected local endpoint advertised by remote client, "
 			"enabling loop checking");
@@ -2493,7 +2506,8 @@ static void codecs_offer(struct call_media *receiver, struct call_media *sender,
 				.codec_set = flags->codec_set,
 				.allow_asymmetric = !!flags->allow_asymmetric_codecs);
 	codec_store_strip(&sender->codecs, &flags->codec_ignore, flags->codec_except);
-	codec_store_check_empty(&sender->codecs, &sp->codecs, flags);
+	if (sp->rtp_endpoint.port != 0)
+		codec_store_check_empty(&sender->codecs, &sp->codecs, flags);
 	codec_store_accept(&sender->codecs, &flags->codec_accept, NULL);
 	codec_store_accept(&sender->codecs, &flags->codec_consume, &sp->codecs);
 	codec_store_track(&sender->codecs, &flags->codec_mask);
@@ -2526,7 +2540,8 @@ static void codecs_offer(struct call_media *receiver, struct call_media *sender,
 	codec_store_strip(&receiver->codecs, &flags->codec_mask, flags->codec_except);
 	codec_store_offer(&receiver->codecs, &flags->codec_offer, &sp->codecs);
 	codec_store_transcode(&receiver->codecs, &flags->codec_transcode, &sp->codecs);
-	codec_store_check_empty(&receiver->codecs, &sp->codecs, flags);
+	if (sp->rtp_endpoint.port != 0)
+		codec_store_check_empty(&receiver->codecs, &sp->codecs, flags);
 	codec_store_synthesise(&receiver->codecs, &sender->codecs);
 
 	// update supp codecs based on actions so far
@@ -2582,7 +2597,8 @@ static void codecs_answer(struct call_media *receiver, struct call_media *sender
 				.allow_asymmetric = !!flags->allow_asymmetric_codecs);
 	codec_store_strip(&sender->codecs, &flags->codec_strip, flags->codec_except);
 	codec_store_offer(&sender->codecs, &flags->codec_offer, &sp->codecs);
-	codec_store_check_empty(&sender->codecs, &sp->codecs, flags);
+	if (sp->rtp_endpoint.port != 0)
+		codec_store_check_empty(&sender->codecs, &sp->codecs, flags);
 
 	// restore list of originally offered codecs
 	codec_store_copy(&receiver->codecs, &receiver->offered_codecs);
@@ -3226,7 +3242,7 @@ static void media_update_flags(struct call_media *media, struct stream_params *s
 	/* copy parameters advertised by the sender of this message */
 	bf_copy_same(&media->media_flags, &sp->sp_flags,
 			SHARED_FLAG_RTCP_MUX | SHARED_FLAG_ASYMMETRIC | SHARED_FLAG_UNIDIRECTIONAL |
-			SHARED_FLAG_ICE | SHARED_FLAG_TRICKLE_ICE | SHARED_FLAG_ICE_LITE_PEER |
+			SHARED_FLAG_ICE | SHARED_FLAG_ICE2 | SHARED_FLAG_TRICKLE_ICE | SHARED_FLAG_ICE_LITE_PEER |
 			SHARED_FLAG_END_OF_CANDIDATES | SHARED_FLAG_EXTMAP_SHORT |
 			SHARED_FLAG_RTCP_FB | SHARED_FLAG_LEGACY_OSRTP | SHARED_FLAG_LEGACY_OSRTP_REV);
 }
@@ -3539,10 +3555,12 @@ static void monologue_bundle_set_fds(struct call_monologue *ml) {
 			dtls_shutdown(ms);
 
 			// XXX close sockets that are not needed?
-			t_queue_clear(&ms->sfds);
+			t_queue_clear_full(&ms->sfds, stream_fd_dec);
 
-			for (__auto_type sl = bs->sfds.head; sl; sl = sl->next)
+			for (__auto_type sl = bs->sfds.head; sl; sl = sl->next) {
+				stream_fd_inc(sl->data);
 				t_queue_push_tail(&ms->sfds, sl->data);
+			}
 
 			ms->selected_sfd = bs->selected_sfd;
 
@@ -3762,7 +3780,7 @@ static bool media_open_ports(struct call_media *media) {
 		if (em_il->list.length)
 			continue; // not empty, we can use these
 
-		__C_DBG("allocating stream_fds for %u ports", em->num_ports);
+		dbg_int("allocating stream_fds for %u ports", em->num_ports);
 		MEDIA_CLEAR(media, PUBLIC);
 
 		socket_port_q q = IQUEUE_INIT;
@@ -3825,12 +3843,24 @@ int monologue_offer_answer(struct call_monologue *monologues[2], sdp_streams_q *
 
 	__call_monologue_init_from_flags(sender_ml, receiver_ml, flags);
 
+	/* Forced egress SSRCs: remember them on the monologue of the party the
+	 * respective SSRC is meant for. The sender of an offer is the offerer,
+	 * otherwise the sender is the answerer. */
+	if (flags->ssrc_force.egress_to_offerer || flags->ssrc_force.egress_to_answerer) {
+		struct call_monologue *offerer_ml = is_offer ? sender_ml : receiver_ml;
+		struct call_monologue *answerer_ml = is_offer ? receiver_ml : sender_ml;
+		if (offerer_ml && flags->ssrc_force.egress_to_offerer)
+			offerer_ml->force_egress_ssrc = flags->ssrc_force.egress_to_offerer;
+		if (answerer_ml && flags->ssrc_force.egress_to_answerer)
+			answerer_ml->force_egress_ssrc = flags->ssrc_force.egress_to_answerer;
+	}
+
 	if (flags->exclude_recording) {
 		ML_SET(receiver_ml, NO_RECORDING);
 		ML_SET(sender_ml, NO_RECORDING);
 	}
 
-	__C_DBG("this="STR_FORMAT" other="STR_FORMAT, STR_FMT(&receiver_ml->tag), STR_FMT(&sender_ml->tag));
+	dbg_int("this="STR_FORMAT" other="STR_FORMAT, STR_FMT(&receiver_ml->tag), STR_FMT(&sender_ml->tag));
 
 	if (flags->opmode == OP_OFFER)
 		ML_CLEAR(receiver_ml, FINAL_RESPONSE);
@@ -3844,7 +3874,7 @@ int monologue_offer_answer(struct call_monologue *monologues[2], sdp_streams_q *
 
 	for (__auto_type sp_iter = streams->head; sp_iter; sp_iter = sp_iter->next) {
 		struct stream_params *sp = sp_iter->data;
-		__C_DBG("processing media stream #%u", sp->index);
+		dbg_int("processing media stream #%u", sp->index);
 		assert(sp->index > 0);
 
 		/**
@@ -5435,8 +5465,7 @@ void media_subscription_free(struct media_subscription *p) {
 	g_free(p);
 }
 
-void call_media_free(struct call_media **mdp) {
-	struct call_media *md = *mdp;
+void call_media_free(struct call_media *md) {
 	crypto_params_sdes_queue_clear(&md->sdes_in);
 	crypto_params_sdes_queue_clear(&md->sdes_out);
 	t_queue_clear(&md->streams);
@@ -5493,7 +5522,7 @@ static void __call_free(call_t *c) {
 
 	while (c->medias.head) {
 		md = t_queue_pop_head(&c->medias);
-		call_media_free(&md);
+		call_media_free(md);
 	}
 
 	while (c->endpoint_maps.head) {
@@ -5714,6 +5743,11 @@ static gboolean fragment_move(str *key, fragment_q *q, void *c) {
 // both calls must be locked and a reference held. call2 reference will be released if successful
 __attribute__((nonnull(1, 2)))
 static bool call_merge(call_t *call, call_t *call2) {
+	if (call == call2) {
+		obj_release(call2);
+		return true;
+	}
+
 	// chcek for tag collisions: duplicate tags are a failure
 	for (auto_iter(l, call2->monologues.head); l; l = l->next) {
 		if (t_hash_table_lookup(call->tags, &l->data->tag))
@@ -5785,29 +5819,40 @@ static bool call_merge(call_t *call, call_t *call2) {
 
 	// redirect hash table entry for old ID. store old ID in new call
 
-	str *old_id = call_str_dup(&call2->callid);
-	t_queue_push_tail(&call->callid_aliases, old_id);
+	t_queue_push_tail(&call->callid_aliases, call_str_dup(&call2->callid));
+
+	while (call2->callid_aliases.length)
+		t_queue_push_tail(&call->callid_aliases, t_queue_pop_head(&call2->callid_aliases));
+
+	call_q ht_calls = TYPED_GQUEUE_INIT;
 
 	rwlock_lock_w(&rtpe_callhash_lock);
 
-	call_t *call_ht = NULL;
-	t_hash_table_steal_extended(rtpe_callhash, &call2->callid, NULL, &call_ht);
-	if (call_ht) {
-		if (call_ht != call2) {
-			// already deleted and replace by a different call
-			t_hash_table_insert(rtpe_callhash, &call_ht->callid, call_ht);
-			call_ht = NULL;
-		}
-		else {
-			// insert a new reference under the old call ID
-			t_hash_table_insert(rtpe_callhash, old_id, obj_get(call));
-			RTPE_GAUGE_DEC(total_sessions);
-		}
-	} // else: already deleted
+	for (auto_iter(l, call->callid_aliases.head); l; l = l->next) {
+		str *old_id = l->data;
+		str *id_ht;
+		call_t *call_ht;
+		t_hash_table_steal_extended(rtpe_callhash, old_id, &id_ht, &call_ht);
+		if (call_ht) {
+			if (call_ht != call2) {
+				// already deleted and replace by a different call
+				// (or possibly it's "call")
+				// either way, return it to the table
+				t_hash_table_insert(rtpe_callhash, id_ht, call_ht);
+			}
+			else {
+				// insert a new reference under the old call ID
+				t_hash_table_insert(rtpe_callhash, old_id, obj_get(call));
+				RTPE_GAUGE_DEC(total_sessions);
+				t_queue_push_tail(&ht_calls, call_ht);
+			}
+		} // else: already deleted
+	}
 
 	rwlock_unlock_w(&rtpe_callhash_lock);
 
-	obj_release(call_ht);
+	while (ht_calls.length)
+		obj_put(t_queue_pop_head(&ht_calls));
 
 	__call_iterator_remove(call2);
 	mqtt_timer_stop(&call2->mqtt_timer);
@@ -5857,13 +5902,14 @@ call_t *call_get_opmode(const str *callid, enum ng_opmode opmode) {
  *
  * Must be called with call->master_lock held in W.
  */
-struct call_monologue *__monologue_create(call_t *call) {
+struct call_monologue *__monologue_create(call_t *call, const str *callid) {
 	struct call_monologue *ret;
 
-	__C_DBG("creating new monologue");
+	dbg_int("creating new monologue");
 	ret = uid_alloc(&call->monologues);
 
 	ret->call = call;
+	ret->call_id = call_str_cpy(callid);
 	ret->created_us = rtpe_now;
 	ret->associated_tags = g_hash_table_new(g_direct_hash, g_direct_equal);
 	ret->medias = medias_arr_new();
@@ -5888,7 +5934,7 @@ void __monologue_tag(struct call_monologue *ml, const str *tag) {
 	call_t *call = ml->call;
 
 	if (!ml->tag.s) {
-		__C_DBG("tagging monologue with '" STR_FORMAT "'", STR_FMT(tag));
+		dbg_int("tagging monologue with '" STR_FORMAT "'", STR_FMT(tag));
 		ml->tag = call_str_cpy(tag);
 		t_hash_table_insert(call->tags, &ml->tag, ml);
 		return;
@@ -5898,7 +5944,7 @@ void __monologue_tag(struct call_monologue *ml, const str *tag) {
 		return; // no change
 
 	// to-tag has changed, save previous as alias
-	__C_DBG("tagging monologue with '" STR_FORMAT "', saving previous '" STR_FORMAT "' as alias",
+	dbg_int("tagging monologue with '" STR_FORMAT "', saving previous '" STR_FORMAT "' as alias",
 			STR_FMT(tag), STR_FMT(&ml->tag));
 	// remove old entry first, as `ml->tag` will be changed
 	t_hash_table_remove(call->tags, &ml->tag);
@@ -5919,7 +5965,7 @@ void __monologue_viabranch(struct call_monologue *ml, const str *viabranch) {
 	if (!viabranch || !viabranch->len)
 		return;
 
-	__C_DBG("tagging monologue with viabranch '"STR_FORMAT"'", STR_FMT(viabranch));
+	dbg_int("tagging monologue with viabranch '"STR_FORMAT"'", STR_FMT(viabranch));
 	if (ml->viabranch.s)
 		t_hash_table_remove(call->viabranches, &ml->viabranch);
 	ml->viabranch = call_str_cpy(viabranch);
@@ -6046,16 +6092,13 @@ static void __tags_unassociate(struct call_monologue *a, struct call_monologue *
 /**
  * Marks the monologue for destruction, or destroys it immediately.
  * It also iterates through the associated monologues and does the same for them.
- *
- * Returns `true`, if we need to update Redis.
  */
-static bool monologue_delete_iter(struct call_monologue *a, int64_t delete_delay_us) {
+static void monologue_delete_iter(struct call_monologue *a, int64_t delete_delay_us) {
 	call_t *call = a->call;
 	if (!call)
-		return 0;
+		return;
 
 	GList *associated = g_hash_table_get_values(a->associated_tags);
-	bool update_redis = false;
 
 	if (delete_delay_us > 0) {
 		ilog(LOG_INFO, "Scheduling deletion of call branch '" STR_FORMAT_M "' "
@@ -6069,7 +6112,6 @@ static bool monologue_delete_iter(struct call_monologue *a, int64_t delete_delay
 		ilog(LOG_INFO, "Deleting call branch '" STR_FORMAT_M "' (via-branch '" STR_FORMAT_M "')",
 				STR_FMT_M(&a->tag), STR_FMT0_M(&a->viabranch));
 		monologue_destroy(a);
-		update_redis = true;
 	}
 
 	/* Look into all associated monologues: cascade deletion to those,
@@ -6084,7 +6126,6 @@ static bool monologue_delete_iter(struct call_monologue *a, int64_t delete_delay
 	}
 
 	g_list_free(associated);
-	return update_redis;
 }
 
 /**
@@ -6121,10 +6162,10 @@ static struct call_monologue *call_get_monologue_alias(call_t *call, const str *
  *
  * Must be called with call->master_lock held in W.
  */
-struct call_monologue *call_get_or_create_monologue(call_t *call, const str *fromtag) {
+struct call_monologue *call_get_or_create_monologue(call_t *call, const str *callid, const str *fromtag) {
 	struct call_monologue *ret = call_get_monologue(call, fromtag);
 	if (!ret) {
-		ret = __monologue_create(call);
+		ret = __monologue_create(call, callid);
 		__monologue_tag(ret, fromtag);
 	}
 	return ret;
@@ -6151,7 +6192,7 @@ static void __tags_associate(struct call_monologue *a, struct call_monologue *b)
 static bool call_monologues_associations_left(call_t * c) {
 	for (__auto_type l = c->monologues.head; l; l = l->next)
 	{
-		struct call_monologue * ml = l->data;
+		struct call_monologue *ml = l->data;
 		if (g_hash_table_size(ml->associated_tags) > 0)
 			return true;
 	}
@@ -6172,7 +6213,10 @@ static bool call_monologues_associations_left(call_t * c) {
  *
  * `dialogue` must be initialised to zero.
  */
-static int call_get_monologue_new(struct call_monologue *monologues[2], call_t *call,
+__attribute__((nonnull(1, 2, 3, 4)))
+static int call_get_monologue_new(struct call_monologue *monologues[2],
+		call_t *call,
+		const str *callid,
 		const str *fromtag,
 		const str *totag,
 		const str *viabranch,
@@ -6180,18 +6224,18 @@ static int call_get_monologue_new(struct call_monologue *monologues[2], call_t *
 {
 	struct call_monologue *ret, *os = NULL; /* ret - initial offer, os - other side */
 
-	__C_DBG("getting monologue for tag '"STR_FORMAT"' in call '"STR_FORMAT"'",
+	dbg_int("getting monologue for tag '"STR_FORMAT"' in call '"STR_FORMAT"'",
 			STR_FMT(fromtag), STR_FMT(&call->callid));
 
 	ret = call_get_monologue_alias(call, fromtag, flags, &flags->sdp, ep);
 	if (!ret) {
 		/* this is a brand new offer */
-		ret = __monologue_create(call);
+		ret = __monologue_create(call, callid);
 		__monologue_tag(ret, fromtag);
 		goto new_branch;
 	}
 
-	__C_DBG("found existing monologue");
+	dbg_int("found existing monologue");
 	/* unkernelize existing monologue medias, which are subscribed to something */
 	__monologue_unconfirm(ret, "signalling on existing monologue");
 
@@ -6219,8 +6263,8 @@ static int call_get_monologue_new(struct call_monologue *monologues[2], call_t *
 	/* we need both sides of the dialogue even in the initial offer, so create
 	 * another monologue without to-tag (to be filled in later) */
 new_branch:
-	__C_DBG("create new \"other side\" monologue for viabranch "STR_FORMAT, STR_FMT0(viabranch));
-	os = __monologue_create(call);
+	dbg_int("create new \"other side\" monologue for viabranch "STR_FORMAT, STR_FMT0(viabranch));
+	os = __monologue_create(call, callid);
 	__monologue_viabranch(os, viabranch);
 	goto finish;
 
@@ -6264,7 +6308,10 @@ finish:
  *
  * `dialogue` must be initialised to zero.
  */
-static int call_get_dialogue(struct call_monologue *monologues[2], call_t *call,
+__attribute__((nonnull(1, 2, 3, 4)))
+static int call_get_dialogue(struct call_monologue *monologues[2],
+		call_t *call,
+		const str *callid,
 		const str *fromtag,
 		const str *totag,
 		const str *viabranch,
@@ -6272,7 +6319,7 @@ static int call_get_dialogue(struct call_monologue *monologues[2], call_t *call,
 {
 	struct call_monologue *ft, *tt;
 
-	__C_DBG("getting dialogue for tags '"STR_FORMAT"'<>'"STR_FORMAT"' in call '"STR_FORMAT"'",
+	dbg_int("getting dialogue for tags '" STR_FORMAT "'<>'" STR_FORMAT "' in call '" STR_FORMAT "'",
 			STR_FMT(fromtag), STR_FMT(totag), STR_FMT(&call->callid));
 
 	/* ft - is always this side's tag (in offer it's message's from-tag, in answer it's message's to-tag)
@@ -6282,12 +6329,12 @@ static int call_get_dialogue(struct call_monologue *monologues[2], call_t *call,
 	/* we start with the to-tag. if it's not known, we treat it as a branched offer */
 	tt = call_get_monologue(call, totag);
 	if (!tt)
-		return call_get_monologue_new(monologues, call, fromtag, totag, viabranch, flags, ep);
+		return call_get_monologue_new(monologues, call, callid, fromtag, totag, viabranch, flags, ep);
 
 	/* if the from-tag is known already, return that */
 	ft = call_get_monologue_alias(call, fromtag, flags, &flags->sdp, ep);
 	if (ft) {
-		__C_DBG("found existing dialogue");
+		dbg_int("found existing dialogue");
 
 		/* detect whether given ft's medias
 		 * already seen as subscribers of tt's medias, otherwise setup tags */
@@ -6323,7 +6370,7 @@ static int call_get_dialogue(struct call_monologue *monologues[2], call_t *call,
 			struct media_subscription *ms = media->media_subscriptions.head;
 			if (ms->monologue) {
 				ft = ms->monologue;
-				__C_DBG("Found existing monologue '" STR_FORMAT "' for this side, by lookup of other side subscriptions",
+				dbg_int("Found existing monologue '" STR_FORMAT "' for this side, by lookup of other side subscriptions",
 						STR_FMT(&ft->tag));
 				break;
 			}
@@ -6335,14 +6382,14 @@ static int call_get_dialogue(struct call_monologue *monologues[2], call_t *call,
 	 * hence `ft->tag` has to be empty at this stage.
 	 */
 	if (!ft)
-		ft = __monologue_create(call);
+		ft = __monologue_create(call, callid);
 	else if (ft->tag.s) {
 		// Allow an updated/changed to-tag in answers unless the flag to
 		// suppress this feature is set. A changed to-tag will be stored
 		// as a tag alias.
 		if (!flags || flags->opmode != OP_ANSWER || flags->new_branch
 				|| (ML_ISSET(ft, FINAL_RESPONSE) && !flags->provisional))
-			ft = __monologue_create(call);
+			ft = __monologue_create(call, callid);
 	}
 
 tag_setup:
@@ -6370,7 +6417,9 @@ done:
 /* fromtag and totag strictly correspond to the directionality of the message, not to the actual
  * SIP headers. IOW, the fromtag corresponds to the monologue sending this message, even if the
  * tag is actually from the TO header of the SIP message (as it would be in a 200 OK) */
-int call_get_mono_dialogue(struct call_monologue *monologues[2], call_t *call,
+int call_get_mono_dialogue(struct call_monologue *monologues[2],
+		call_t *call,
+		const str *callid,
 		const str *fromtag,
 		const str *totag,
 		const str *viabranch,
@@ -6378,9 +6427,9 @@ int call_get_mono_dialogue(struct call_monologue *monologues[2], call_t *call,
 {
 	/* initial offer */
 	if (!totag || !totag->s)
-		return call_get_monologue_new(monologues, call, fromtag, NULL, viabranch, flags, ep);
+		return call_get_monologue_new(monologues, call, callid, fromtag, NULL, viabranch, flags, ep);
 
-	return call_get_dialogue(monologues, call, fromtag, totag, viabranch, flags, ep);
+	return call_get_dialogue(monologues, call, callid, fromtag, totag, viabranch, flags, ep);
 }
 
 static void media_stop(struct call_media *m) {
@@ -6426,15 +6475,126 @@ static void monologue_stop(struct call_monologue *ml, bool stop_media_subscriber
 }
 
 
+__attribute__((nonnull(1)))
+static int call_delete_by_id(call_t *c, const str *callid, ng_command_ctx_t *ctx, int64_t delete_delay,
+		bool stats);
+
+
+// call must be locked in W and will be unlocked upon returning
+__attribute__((nonnull(1)))
+static int call_do_delete_full(call_t *c, int64_t delete_delay) {
+	if (delete_delay > 0) {
+		ilog(LOG_INFO, "Scheduling deletion of entire call in %" PRId64 " seconds", delete_delay / 1000000L);
+		c->deleted_us = rtpe_now + delete_delay;
+		rwlock_unlock_w(&c->master_lock);
+
+		redis_update_onekey(c, rtpe_redis_write);
+	}
+	else {
+		ilog(LOG_INFO, "Deleting entire call");
+		rwlock_unlock_w(&c->master_lock);
+		call_destroy(c);
+	}
+
+	obj_release(c);
+
+	return 0;
+}
+
+// call must be locked in W and will be unlocked upon returning
+__attribute__((nonnull(1)))
+static int call_delete_full(call_t *c, const str *callid, ng_command_ctx_t *ctx, int64_t delete_delay,
+		bool stats)
+{
+	if (ctx && stats)
+		ng_call_stats(ctx, c, NULL, NULL, NULL);
+
+	c->destroyed = rtpe_now;
+
+	// short-cut is possible only if there are no call ID aliases
+	if (c->callid_aliases.length != 0)
+		return call_delete_by_id(c, callid, ctx, delete_delay, stats);
+
+	for (__auto_type i = c->monologues.head; i; i = i->next) {
+		__auto_type ml = i->data;
+		monologue_stop(ml, false);
+	}
+
+	return call_do_delete_full(c, delete_delay);
+}
+
+
+// call must be locked in W and will be unlocked upon returning
+__attribute__((nonnull(1, 2)))
+static int call_delete_monologue(call_t *c, const str *callid, struct call_monologue *ml,
+		const str *fromtag, const str *totag,
+		ng_command_ctx_t *ctx, int64_t delete_delay,
+		bool stats)
+{
+	c->destroyed = rtpe_now;
+
+	/* stop media player and all medias of ml.
+	 * same for media subscribers */
+	monologue_stop(ml, true);
+
+	/* check, if we have some associated monologues left, which have own associations
+	 * which means they need a media to flow */
+	monologue_delete_iter(ml, delete_delay);
+
+	/* if there are no associated dialogs, which still require media, then additionally
+	 * ensure, whether we can afford to destroy the whole call now.
+	 * Maybe some of them still need a media to flow */
+	bool del_stop = false;
+	del_stop = call_monologues_associations_left(c);
+
+	if (!del_stop)
+		return call_delete_full(c, callid, ctx, delete_delay, stats);
+
+	if (ctx && stats)
+		ng_call_stats(ctx, c, fromtag, totag, NULL);
+
+	rwlock_unlock_w(&c->master_lock);
+
+	redis_update_onekey(c, rtpe_redis_write);
+	obj_release(c);
+
+	return 0;
+}
+
+
+// call must be locked in W and will be unlocked upon returning
+static int call_delete_by_id(call_t *c, const str *callid, ng_command_ctx_t *ctx, int64_t delete_delay,
+		bool stats)
+{
+	for (__auto_type i = c->monologues.head; i; i = i->next) {
+		__auto_type ml = i->data;
+		if (str_cmp_str(&ml->call_id, callid))
+			continue;
+
+		monologue_stop(ml, true);
+		monologue_delete_iter(ml, delete_delay);
+	}
+
+	if (!call_monologues_associations_left(c))
+		return call_do_delete_full(c, delete_delay);
+
+	rwlock_unlock_w(&c->master_lock);
+
+	redis_update_onekey(c, rtpe_redis_write);
+	obj_release(c);
+
+	return 0;
+}
+
+
 // call must be locked in W.
 // unlocks the call and releases the reference prior to returning, even on error.
-int call_delete_branch(call_t *c, const str *branch,
-	const str *fromtag, const str *totag, ng_command_ctx_t *ctx, int64_t delete_delay)
+int call_delete_branch(call_t *c, const str *callid, const str *branch,
+	const str *fromtag, const str *totag, ng_command_ctx_t *ctx, int64_t delete_delay,
+	bool stats)
 {
 	struct call_monologue *ml;
-	int ret;
 	const str *match_tag;
-	bool update = false;
 
 	if (delete_delay < 0)
 		delete_delay = rtpe_config.delete_delay_us;
@@ -6448,116 +6608,54 @@ int call_delete_branch(call_t *c, const str *branch,
 	}
 
 	if (!fromtag || !fromtag->len)
-		goto del_all;
+		return call_delete_full(c, callid, ctx, delete_delay, stats);
 
 	if ((!totag || !totag->len) && branch && branch->len) {
 		// try a via-branch match
 		ml = t_hash_table_lookup(c->viabranches, branch);
 		if (ml)
-			goto do_delete;
+			return call_delete_monologue(c, callid, ml, fromtag, totag, ctx, delete_delay, stats);
 	}
 
 	match_tag = (totag && totag->len) ? totag : fromtag;
 
 	ml = call_get_monologue(c, match_tag);
-	if (!ml) {
-		if (branch && branch->len) {
-			// also try a via-branch match here
-			ml = t_hash_table_lookup(c->viabranches, branch);
-			if (ml)
-				goto do_delete;
+	if (ml)
+		return call_delete_monologue(c, callid, ml, fromtag, totag, ctx, delete_delay, stats);
+
+	if (branch && branch->len) {
+		// also try a via-branch match here
+		ml = t_hash_table_lookup(c->viabranches, branch);
+		if (ml)
+			return call_delete_monologue(c, callid, ml, fromtag, totag, ctx, delete_delay, stats);
+	}
+
+	/* IMPORTANT!
+	 * last resort: try the from-tag, if we tried the to-tag before and see,
+	 * if the associated dialogue has an empty tag (unknown).
+	 * If that condition is met, then we delete the entire call.
+	 *
+	 * A use case for that is: `delete` done with from-tag and to-tag,
+	 * right away after an `offer` without the to-tag and without use of via-branch.
+	 * Then, looking up the offer side of the call through the from-tag
+	 * and then checking, if the call has not been answered (answer side has an empty to-tag),
+	 * gives a clue whether to delete an entire call. */
+	if (match_tag == totag) {
+		ml = call_get_monologue(c, fromtag);
+		if (ml) {
+			struct call_monologue *sub_ml = ml_medias_subscribed_to_single_ml(ml);
+			if (sub_ml && !sub_ml->tag.len)
+				return call_delete_monologue(c, callid, ml, fromtag, totag, ctx, delete_delay, stats);
 		}
-
-		/* IMPORTANT!
-		 * last resort: try the from-tag, if we tried the to-tag before and see,
-		 * if the associated dialogue has an empty tag (unknown).
-		 * If that condition is met, then we delete the entire call.
-		 *
-		 * A use case for that is: `delete` done with from-tag and to-tag,
-		 * right away after an `offer` without the to-tag and without use of via-branch.
-		 * Then, looking up the offer side of the call through the from-tag
-		 * and then checking, if the call has not been answered (answer side has an empty to-tag),
-		 * gives a clue whether to delete an entire call. */
-		if (match_tag == totag) {
-			ml = call_get_monologue(c, fromtag);
-			if (ml) {
-				struct call_monologue * sub_ml = ml_medias_subscribed_to_single_ml(ml);
-				if (sub_ml && !sub_ml->tag.len)
-					goto do_delete;
-			}
-		}
-
-		ilog(LOG_INFO, "Tag '"STR_FORMAT"' in delete message not found, ignoring",
-				STR_FMT(match_tag));
-		goto err;
 	}
 
-do_delete:
-	c->destroyed = rtpe_now;
+	ilog(LOG_INFO, "Tag '" STR_FORMAT "' in delete message not found, ignoring",
+			STR_FMT(match_tag));
 
-	/* stop media player and all medias of ml.
-	 * same for media subscribers */
-	monologue_stop(ml, true);
-
-	/* check, if we have some associated monologues left, which have own associations
-	 * which means they need a media to flow */
-	update = monologue_delete_iter(ml, delete_delay);
-
-	/* if there are no associated dialogs, which still require media, then additionally
-	 * ensure, whether we can afford to destroy the whole call now.
-	 * Maybe some of them still need a media to flow */
-	bool del_stop = false;
-	del_stop = call_monologues_associations_left(c);
-
-	if (!del_stop)
-		goto del_all;
-
-	if (ctx)
-		ng_call_stats(ctx, c, fromtag, totag, NULL);
-
-	goto success_unlock;
-
-del_all:
-	if (ctx)
-		ng_call_stats(ctx, c, NULL, NULL, NULL);
-
-	for (__auto_type i = c->monologues.head; i; i = i->next) {
-		ml = i->data;
-		monologue_stop(ml, false);
-	}
-
-	c->destroyed = rtpe_now;
-
-	if (delete_delay > 0) {
-		ilog(LOG_INFO, "Scheduling deletion of entire call in %" PRId64 " seconds", delete_delay / 1000000L);
-		c->deleted_us = rtpe_now + delete_delay;
-		rwlock_unlock_w(&c->master_lock);
-	}
-	else {
-		ilog(LOG_INFO, "Deleting entire call");
-		rwlock_unlock_w(&c->master_lock);
-		call_destroy(c);
-		update = false;
-	}
-	goto success;
-
-success_unlock:
 	rwlock_unlock_w(&c->master_lock);
-success:
-	ret = 0;
-	goto out;
-
-err:
-	rwlock_unlock_w(&c->master_lock);
-	ret = -1;
-	goto out;
-
-out:
-	if (update)
-		redis_update_onekey(c, rtpe_redis_write);
 	obj_release(c);
 
-	return ret;
+	return -1;
 }
 
 
@@ -6569,7 +6667,7 @@ int call_delete_branch_by_id(const str *callid, const str *branch,
 		ilog(LOG_INFO, "Call-ID to delete not found");
 		return -1;
 	}
-	return call_delete_branch(c, branch, fromtag, totag, ctx, delete_delay);
+	return call_delete_branch(c, callid, branch, fromtag, totag, ctx, delete_delay, false);
 }
 
 struct call_media *call_make_transform_media(struct call_monologue *ml, const str *type, enum media_type type_id,

@@ -308,6 +308,7 @@ struct media_packet {
 	struct call_media *media_out; // output media
 	struct sink_handler sink;
 	struct media_player_cache_entry *cache_entry;
+	bool recording_egress;
 
 	struct rtp_header *rtp;
 	struct rtcp_packet *rtcp;
@@ -427,7 +428,6 @@ INLINE void stream_fd_dec(stream_fd *sfd) {
 
 void free_sfd_intf_list(struct sfd_intf_list *il);
 void free_release_sfd_intf_list(struct sfd_intf_list *il);
-void free_socket_intf_list(struct socket_intf_list *il);
 
 void __unkernelize(struct packet_stream *, const char *);
 void unkernelize(struct packet_stream *, const char *);

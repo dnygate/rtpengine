@@ -26,6 +26,7 @@
 #include <linux/spinlock.h>
 #include <linux/bsearch.h>
 #include <asm/atomic.h>
+#include <asm/div64.h>
 #include <net/netfilter/nf_tables.h>
 #include <linux/netfilter_ipv4/ip_tables.h>
 #include <linux/netfilter_ipv4.h>
@@ -100,18 +101,6 @@ MODULE_ALIAS("nft-expr-rtpengine");
 		__LINE__, ##__VA_ARGS__)
 #else
 #define DBG(x...) ((void)0)
-#endif
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,10,0)
-#define PAR_STATE_NET(p) (p)->state->net
-#else /* minimum 4.4.x */
-#define PAR_STATE_NET(p) (p)->net
-#endif
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0)
-#define PKTINFO_NET(p) (p)->state->net
-#else
-#define PKTINFO_NET(p) (p)->xt.state->net
 #endif
 
 #if 0
@@ -232,6 +221,10 @@ static bool log_errors = 0;
 module_param(log_errors, bool, 0644);
 MODULE_PARM_DESC(log_errors, "generate kernel log lines from forwarding errors");
 
+static bool api_debug;
+module_param(api_debug, bool, 0644);
+MODULE_PARM_DESC(api_debug, "log verbose errors for incorrect API usage (EINVAL errors)");
+
 
 
 #define log_err(fmt, ...) do { if (log_errors) printk(KERN_NOTICE "rtpengine[%s:%i]: " fmt, \
@@ -256,6 +249,7 @@ static int proc_generic_seqrelease_modref(struct inode *inode, struct file *file
 static int proc_generic_singlerelease_modref(struct inode *inode, struct file *file);
 
 static int proc_list_open(struct inode *, struct file *);
+static int proc_list_close(struct inode *inode, struct file *file);
 
 static void *proc_list_start(struct seq_file *, loff_t *);
 static void proc_list_stop(struct seq_file *, void *);
@@ -299,9 +293,9 @@ static int srtcp_decrypt_aes_gcm(struct re_crypto_context *, struct rtpengine_sr
 static int send_proxy_packet_output(struct sk_buff *skb, struct rtpengine_target *g,
 		int rtp_pt_idx,
 		struct rtpengine_output *o, struct rtp_parsed *rtp, int ssrc_idx,
-		struct net *);
+		struct rtpengine_table *t);
 static int send_proxy_packet(struct sk_buff *skb, const struct re_address *src, const struct re_address *dst,
-		unsigned char tos, struct net *);
+		unsigned char tos, struct net *, struct dst_entry *, struct rtpengine_table *);
 static uint32_t proxy_packet_srtp_encrypt(struct sk_buff *skb, struct re_crypto_context *ctx,
 		struct rtpengine_srtp *srtp,
 		struct rtp_parsed *rtp, int ssrc_idx,
@@ -347,6 +341,8 @@ struct rtpengine_output {
 	struct rtpengine_output_info	output;
 	struct re_crypto_context	encrypt_rtp;
 	struct re_crypto_context	encrypt_rtcp;
+	struct net			*net;
+	struct dst_entry		*dst;
 };
 
 struct rtpengine_target {
@@ -404,7 +400,7 @@ struct re_auto_array {
 struct re_call {
 	atomic_t			refcnt;
 	struct rtpengine_call_info	info;
-	unsigned int			table_id;
+	struct rtpengine_table		*table;
 	u32				hash_bucket;
 	int				deleted; /* protected by calls.lock */
 
@@ -455,8 +451,8 @@ struct re_shm {
 
 struct rtpengine_table {
 	atomic_t			refcnt;
+	atomic_t			opencnt;
 	rwlock_t			target_lock;
-	pid_t				pid;
 
 	unsigned int			id;
 	struct proc_dir_entry		*proc_root;
@@ -483,6 +479,9 @@ struct rtpengine_table {
 	unsigned long			shm_total;
 
 	struct global_stats_counter	*rtpe_stats;
+
+	atomic64_t			skb_refs;
+	atomic64_t			skb_copies;
 
 	spinlock_t			player_lock;
 	struct list_head		play_streams;
@@ -571,7 +570,7 @@ struct re_play_stream_packets {
 	rwlock_t lock;
 	struct list_head packets;
 	unsigned int len;
-	unsigned int table_id;
+	struct rtpengine_table *table;
 	struct list_head table_entry;
 	unsigned int idx;
 };
@@ -587,7 +586,7 @@ struct re_play_stream {
 	struct re_play_stream_packet *position;
 	struct re_timer_thread *timer_thread;
 	uint64_t tree_index;
-	unsigned int table_id;
+	struct rtpengine_table *table;
 	struct list_head table_entry;
 };
 
@@ -637,6 +636,10 @@ struct re_ring_buffer_pair {
 	atomic_t *buf_idx;
 	atomic_t errors;
 	struct task_struct *sender;
+};
+
+struct nft_rtpengine_info {
+	struct rtpengine_table *table;
 };
 
 
@@ -714,7 +717,7 @@ static const struct PROC_OP_STRUCT proc_list_ops = {
 	.PROC_OPEN		= proc_list_open,
 	.PROC_READ		= seq_read,
 	.PROC_LSEEK		= seq_lseek,
-	.PROC_RELEASE		= proc_generic_seqrelease_modref,
+	.PROC_RELEASE		= proc_list_close,
 };
 
 static const struct seq_operations proc_list_seq_ops = {
@@ -1071,6 +1074,8 @@ static void target_put(struct rtpengine_target *t) {
 		for (i = 0; i < t->target.num_destinations; i++) {
 			free_crypto_context(&t->outputs[i].encrypt_rtp);
 			free_crypto_context(&t->outputs[i].encrypt_rtcp);
+			dst_release(t->outputs[i].dst);
+			put_net(t->outputs[i].net);
 		}
 		kfree(t->outputs);
 	}
@@ -1144,7 +1149,8 @@ static void clear_table_player(struct rtpengine_table *t) {
 
 	list_for_each_entry_safe(stream, ts, &t->play_streams, table_entry) {
 		spin_lock(&stream->lock);
-		stream->table_id = -1;
+		table_put(stream->table);
+		stream->table = NULL;
 		idx = stream->idx;
 		spin_unlock(&stream->lock);
 		write_lock(&media_player_lock);
@@ -1159,7 +1165,8 @@ static void clear_table_player(struct rtpengine_table *t) {
 
 	list_for_each_entry_safe(packets, tp, &t->packet_streams, table_entry) {
 		write_lock(&packets->lock);
-		packets->table_id = -1;
+		table_put(packets->table);
+		packets->table = NULL;
 		idx = packets->idx;
 		write_unlock(&packets->lock);
 		write_lock(&media_player_lock);
@@ -1244,7 +1251,6 @@ static void table_put(struct rtpengine_table *t) {
 		release_shm(&t->shms[i]);
 	kfree(t->shms);
 
-	clear_table_proc_files(t);
 #ifdef KERNEL_PLAYER
 	clear_table_player(t);
 #endif
@@ -1329,6 +1335,8 @@ static void call_put(struct re_call *call) {
 	DBG("clearing call proc files\n");
 	clear_proc(&call->root);
 
+	table_put(call->table);
+
 	kfree(call);
 }
 
@@ -1337,10 +1345,6 @@ static void call_put(struct re_call *call) {
 
 static int unlink_table(struct rtpengine_table *t) {
 	unsigned long flags;
-	struct re_call *call;
-
-	if (t->id >= MAX_ID)
-		return -EINVAL;
 
 	DBG("Unlinking table %u\n", t->id);
 
@@ -1349,13 +1353,40 @@ static int unlink_table(struct rtpengine_table *t) {
 		write_unlock_irqrestore(&table_lock, flags);
 		return -EINVAL;
 	}
-	if (t->pid) {
+	// this ref and the entry in rtpe_table
+	if (atomic_read(&t->refcnt) != 2) {
 		write_unlock_irqrestore(&table_lock, flags);
 		return -EBUSY;
 	}
 	rtpe_table[t->id] = NULL;
-	t->id = -1;
+	t->id = -1u;
 	write_unlock_irqrestore(&table_lock, flags);
+	table_put(t);
+
+	// safe to clear, nothing else could be open any more
+	clear_table_proc_files(t);
+
+	// last ref -> free
+	table_put(t);
+
+	return 0;
+}
+
+static int kill_table(struct rtpengine_table *t) {
+	unsigned long flags;
+	struct re_call *call;
+
+	DBG("Killing table %u\n", t->id);
+
+	write_lock_irqsave(&table_lock, flags);
+	if (t->id >= MAX_ID || rtpe_table[t->id] != t) {
+		write_unlock_irqrestore(&table_lock, flags);
+		return -EINVAL;
+	}
+	rtpe_table[t->id] = NULL;
+	t->id = -1u;
+	write_unlock_irqrestore(&table_lock, flags);
+	table_put(t);
 
 	_w_lock(&calls.lock, flags);
 	while (!list_empty(&t->calls)) {
@@ -1366,12 +1397,14 @@ static int unlink_table(struct rtpengine_table *t) {
 	}
 	_w_unlock(&calls.lock, flags);
 
+	// *should* be the last ref
 	clear_table_proc_files(t);
+
+	// last ref -> free
 	table_put(t);
 
 	return 0;
 }
-
 
 
 
@@ -1405,10 +1438,13 @@ static int proc_status_show(struct seq_file *m, void *v) {
 		return -ENOENT;
 
 	read_lock_irqsave(&t->target_lock, flags);
-	seq_printf(m, "Refcount:    %u\n", atomic_read(&t->refcnt) - 1);
-	seq_printf(m, "Control PID: %u\n", t->pid);
+	seq_printf(m, "Refcount:    %u\n", atomic_read(&t->refcnt));
+	seq_printf(m, "Opencount:   %u\n", atomic_read(&t->opencnt));
 	seq_printf(m, "Targets:     %u\n", t->num_targets);
 	read_unlock_irqrestore(&t->target_lock, flags);
+
+	seq_printf(m, "Skb refs:    %lu\n", (unsigned long) atomic64_read(&t->skb_refs));
+	seq_printf(m, "Skb copies:  %lu\n", (unsigned long) atomic64_read(&t->skb_copies));
 
 	// unlocked/unsafe read
 	seq_printf(m, "Players:     %u\n", t->num_play_streams);
@@ -1675,18 +1711,26 @@ static int proc_list_open(struct inode *i, struct file *f) {
 	t = get_table(id);
 	if (!t)
 		return -ENOENT;
-	table_put(t);
 
 	err = seq_open(f, &proc_list_seq_ops);
-	if (err)
+	if (err) {
+		table_put(t);
 		return err;
+	}
 
 	p = f->private_data;
-	p->private = (void *) (unsigned long) id;
+	p->private = t;
 
 	return 0;
 }
 
+static int proc_list_close(struct inode *inode, struct file *file) {
+	struct seq_file *p = file->private_data;
+	struct rtpengine_table *t = p ? p->private : NULL;
+	if (t)
+		table_put(t);
+	return proc_generic_seqrelease_modref(inode, file);
+}
 
 
 
@@ -1698,15 +1742,13 @@ static void proc_list_stop(struct seq_file *f, void *v) {
 }
 
 static void *proc_list_next(struct seq_file *f, void *v, loff_t *o) {
-	uint32_t id = (uint32_t) (unsigned long) f->private;
-	struct rtpengine_table *t;
+	struct rtpengine_table *t = f->private;
 	struct rtpengine_target *g;
 	int port, addr_bucket;
 
 	addr_bucket = ((int) *o) >> 17;
 	port = ((int) *o) & 0x1ffff;
 
-	t = get_table(id);
 	if (!t)
 		return NULL;
 
@@ -1716,7 +1758,6 @@ static void *proc_list_next(struct seq_file *f, void *v, loff_t *o) {
 	g = find_next_target(t, &addr_bucket, &port);
 
 	*o = (addr_bucket << 17) | port;
-	table_put(t);
 
 	if (!g) // EOF
 		*o = 256 << 17;
@@ -1808,6 +1849,7 @@ static int proc_list_show(struct seq_file *f, void *v) {
 	struct rtpengine_target *g = v;
 	unsigned int i, j;
 	unsigned long flags;
+	uint64_t last_packet;
 
 	seq_printf(f, "local ");
 	seq_addr_print(f, &g->target.local);
@@ -1838,8 +1880,9 @@ static int proc_list_show(struct seq_file *f, void *v) {
 			g->target.pt_media_idx[i]);
 	}
 
-	seq_printf(f, "    last packet: %lli\n",
-			(long long) atomic64_read(&g->target.stats->last_packet_us) / 1000000L);
+	last_packet = atomic64_read(&g->target.stats->last_packet_us);
+	do_div(last_packet, 1000000L);
+	seq_printf(f, "    last packet: %lli\n", (long long) last_packet);
 
 	seq_printf(f, "    SSRC in:");
 	for (i = 0; i < ARRAY_SIZE(g->target.ssrc); i++) {
@@ -2625,6 +2668,14 @@ err:
 	return err;
 }
 
+
+#define ret_einval(msg, fmt...) do { \
+	if (api_debug) \
+		printk(KERN_WARNING msg "\n", ##fmt); \
+	return -EINVAL; \
+} while (0)
+
+
 static int table_new_target(struct rtpengine_table *t, struct rtpengine_target_info *i) {
 	unsigned char hi, lo;
 	unsigned int rda_hash, rh_it;
@@ -2646,35 +2697,43 @@ static int table_new_target(struct rtpengine_table *t, struct rtpengine_target_i
 	if (!t->rtpe_stats)
 		return -EIO;
 	if (!is_valid_address(&i->local))
-		return -EINVAL;
+		ret_einval("invalid local address");
 	if (i->num_destinations > RTPE_MAX_FORWARD_DESTINATIONS)
-		return -EINVAL;
+		ret_einval("too many destinations (%u)", i->num_destinations);
 	if (i->num_payload_types > RTPE_NUM_PAYLOAD_TYPES)
-		return -EINVAL;
+		ret_einval("too many payload types (%u)", i->num_payload_types);
 	if (!i->non_forwarding) {
 		if (!i->num_destinations)
-			return -EINVAL;
+			ret_einval("forwarding target but zero destinations");
 		for (u = 0; u < RTPE_NUM_OUTPUT_MEDIA; u++) {
 			if (i->media_output_idxs[u].rtp_start_idx >= i->num_destinations)
-				return -EINVAL;
+				ret_einval("invalid RTP start index for output [%u] (%u >= %u)",
+						u, i->media_output_idxs[u].rtp_start_idx, i->num_destinations);
 			if (i->media_output_idxs[u].rtp_end_idx > i->num_destinations)
-				return -EINVAL;
+				ret_einval("invalid RTP end index for output [%u] (%u > %u)",
+						u, i->media_output_idxs[u].rtp_end_idx, i->num_destinations);
 			if (i->media_output_idxs[u].rtp_end_idx < i->media_output_idxs[u].rtp_start_idx)
-				return -EINVAL;
+				ret_einval("invalid RTP end index for output [%u] (%u < %u)",
+						u, i->media_output_idxs[u].rtp_end_idx,
+						i->media_output_idxs[u].rtp_start_idx);
 			if (i->media_output_idxs[u].rtcp_start_idx >= i->num_destinations)
-				return -EINVAL;
+				ret_einval("invalid RTCP start index for output [%u] (%u >= %u)",
+						u, i->media_output_idxs[u].rtcp_start_idx, i->num_destinations);
 			if (i->media_output_idxs[u].rtcp_end_idx > i->num_destinations)
-				return -EINVAL;
+				ret_einval("invalid RTCP end index for output [%u] (%u > %u)",
+						u, i->media_output_idxs[u].rtcp_end_idx, i->num_destinations);
 			if (i->media_output_idxs[u].rtcp_end_idx < i->media_output_idxs[u].rtcp_start_idx)
-				return -EINVAL;
+				ret_einval("invalid RTCP end index for output [%u] (%u < %u)",
+						u, i->media_output_idxs[u].rtcp_end_idx,
+						i->media_output_idxs[u].rtcp_start_idx);
 		}
 	}
 	else {
 		if (i->num_destinations)
-			return -EINVAL;
+			ret_einval("non forwarding target but %u destinations", i->num_destinations);
 	}
 	if (validate_srtp(&i->decrypt))
-		return -EINVAL;
+		ret_einval("decrypt info not valid");
 
 	iface_stats = shm_map_resolve(t, i->iface_stats, sizeof(*iface_stats));
 	if (!iface_stats)
@@ -2687,7 +2746,7 @@ static int table_new_target(struct rtpengine_table *t, struct rtpengine_target_i
 		if (!pt_stats[u])
 			return -EFAULT;
 		if (i->pt_media_idx[u] > RTPE_NUM_OUTPUT_MEDIA)
-			return -EINVAL;
+			ret_einval("PT index [%u] not valid (%u)", u, i->pt_media_idx[u]);
 	}
 	for (u = 0; u < RTPE_NUM_SSRC_TRACKING; u++) {
 		if (!i->ssrc[u])
@@ -2840,6 +2899,36 @@ fail1:
 	return err;
 }
 
+
+static struct dst_entry *get_output_dst4(struct net *net, const struct re_address *dst,
+		const struct re_address *src, unsigned char tos)
+{
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,10,0)) || \
+	(defined(RHEL_RELEASE_CODE) && LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0) && \
+		RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9,6))
+	struct rtable *rt = ip_route_output(net, dst->u.ipv4, src->u.ipv4, tos, 0, 0);
+#else
+	struct rtable *rt = ip_route_output(net, dst->u.ipv4, src->u.ipv4, tos, 0);
+#endif
+	if (IS_ERR(rt))
+		return NULL;
+	return &rt->dst;
+}
+
+
+static struct dst_entry *get_output_dst6(struct net *net, const struct re_address *dst,
+		const struct re_address *src)
+{
+	struct flowi6 fl6;
+
+	memset(&fl6, 0, sizeof(fl6));
+	memcpy(&fl6.saddr, src->u.ipv6, sizeof(fl6.saddr));
+	memcpy(&fl6.daddr, dst->u.ipv6, sizeof(fl6.daddr));
+
+	return ip6_route_output(net, NULL, &fl6);
+}
+
+
 static int table_add_destination(struct rtpengine_table *t, struct rtpengine_destination_info *i) {
 	unsigned long flags;
 	int err;
@@ -2848,17 +2937,24 @@ static int table_add_destination(struct rtpengine_table *t, struct rtpengine_des
 	struct stream_stats *stats;
 	struct ssrc_stats *ssrc_stats[RTPE_NUM_SSRC_TRACKING] = {0};
 	unsigned int u;
+	struct net *net = NULL;
+	struct dst_entry *dst = NULL;
+
+	if (!current->nsproxy || !current->nsproxy->net_ns)
+		return -ENETUNREACH;
+	net = current->nsproxy->net_ns;
 
 	// validate input
 
 	if (!is_valid_address(&i->output.src_addr))
-		return -EINVAL;
+		ret_einval("invalid source address");
 	if (!is_valid_address(&i->output.dst_addr))
-		return -EINVAL;
+		ret_einval("invalid destination address");
 	if (i->output.src_addr.family != i->output.dst_addr.family)
-		return -EINVAL;
+		ret_einval("address family mismatch (%u <> %u)", i->output.src_addr.family,
+				i->output.dst_addr.family);
 	if (validate_srtp(&i->output.encrypt))
-		return -EINVAL;
+		ret_einval("encrypt info not valid");
 
 	iface_stats = shm_map_resolve(t, i->output.iface_stats, sizeof(*iface_stats));
 	if (!iface_stats)
@@ -2880,6 +2976,21 @@ static int table_add_destination(struct rtpengine_table *t, struct rtpengine_des
 	g = get_target(t, &i->local);
 	if (!g)
 		return -ENOENT;
+
+
+	if (i->output.dst_addr.family == AF_INET)
+		dst = get_output_dst4(net, &i->output.dst_addr, &i->output.src_addr, i->output.tos);
+	else // IP6
+		dst = get_output_dst6(net, &i->output.dst_addr, &i->output.src_addr);
+
+	err = -ENETUNREACH;
+	if (!dst)
+		goto out2;
+	if (dst->error) {
+		err = dst->error;
+		goto out2;
+	}
+
 
 	// ready to fill in
 
@@ -2928,13 +3039,20 @@ static int table_add_destination(struct rtpengine_table *t, struct rtpengine_des
 	if (err)
 		goto out;
 
+	// take over dst_entry reference
+	g->outputs[i->num].dst = dst;
+	dst = NULL;
+	g->outputs[i->num].net = get_net(net);
+
 	g->outputs_unfilled--;
 
 	err = 0;
 
 out:
 	_w_unlock(&g->outputs_lock, flags);
+out2:
 	target_put(g);
+	dst_release(dst);
 	return err;
 }
 
@@ -3011,6 +3129,8 @@ static ssize_t proc_main_control_write(struct file *file, const char __user *buf
 	if (copy_from_user(&b, buf, buflen))
 		return -EFAULT;
 
+	b[buflen] = '\0';
+
 	if (!strncmp(b, "add ", 4)) {
 		id = simple_strtoul(b + 4, &endp, 10);
 		if (endp == b + 4)
@@ -3033,7 +3153,20 @@ static ssize_t proc_main_control_write(struct file *file, const char __user *buf
 		if (!t)
 			return -ENOENT;
 		err = unlink_table(t);
-		table_put(t);
+		t = NULL;
+		if (err)
+			return err;
+	}
+	else if (!strncmp(b, "kill ", 5)) {
+		id = simple_strtoul(b + 5, &endp, 10);
+		if (endp == b + 5)
+			return -EINVAL;
+		if (id >= MAX_ID)
+			return -EINVAL;
+		t = get_table((uint32_t) id);
+		if (!t)
+			return -ENOENT;
+		err = kill_table(t);
 		t = NULL;
 		if (err)
 			return err;
@@ -3049,8 +3182,10 @@ static ssize_t proc_main_control_write(struct file *file, const char __user *buf
 static int proc_control_open(struct inode *inode, struct file *file) {
 	uint32_t id;
 	struct rtpengine_table *t;
-	unsigned long flags;
 	int err;
+
+	if (file->private_data)
+		return -ENXIO;
 
 	if ((err = proc_generic_open_modref(inode, file)))
 		return err;
@@ -3060,16 +3195,9 @@ static int proc_control_open(struct inode *inode, struct file *file) {
 	if (!t)
 		return -ENOENT;
 
-	write_lock_irqsave(&table_lock, flags);
-	if (t->pid) {
-		write_unlock_irqrestore(&table_lock, flags);
-		table_put(t);
-		return -EBUSY;
-	}
-	t->pid = current->tgid;
-	write_unlock_irqrestore(&table_lock, flags);
+	atomic_inc(&t->opencnt);
 
-	table_put(t);
+	file->private_data = t;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,1,0)
 	return stream_open(inode, file);
 #else
@@ -3078,19 +3206,15 @@ static int proc_control_open(struct inode *inode, struct file *file) {
 }
 
 static int proc_control_close(struct inode *inode, struct file *file) {
-	uint32_t id;
 	struct rtpengine_table *t;
-	unsigned long flags;
 
-	id = (uint32_t) (unsigned long) PDE_DATA(inode);
-	t = get_table(id);
+	t = file->private_data;
 	if (!t)
 		return 0;
 
-	write_lock_irqsave(&table_lock, flags);
-	t->pid = 0;
-	write_unlock_irqrestore(&table_lock, flags);
+	atomic_dec(&t->opencnt);
 
+	file->private_data = NULL;
 	table_put(t);
 
 	proc_generic_close_modref(inode, file);
@@ -3179,7 +3303,7 @@ static struct re_call *get_call(struct rtpengine_table *table, unsigned int idx)
 	ret = calls.array[idx];
 	if (!ret)
 		return NULL;
-	if (table && ret->table_id != table->id)
+	if (table && ret->table != table)
 		return NULL;
 	if (ret->deleted)
 		return NULL;
@@ -3271,7 +3395,8 @@ static int table_new_call(struct rtpengine_table *table, struct rtpengine_call_i
 		return -ENOMEM;
 
 	atomic_set(&call->refcnt, 1);
-	call->table_id = table->id;
+	call->table = table;
+	ref_get(table);
 	INIT_LIST_HEAD(&call->streams);
 	INIT_LIST_HEAD(&call->table_entry);
 
@@ -3586,34 +3711,6 @@ static void del_stream(struct re_stream *stream, struct rtpengine_table *table) 
 	stream_put(stream);
 }
 
-static int table_del_stream(struct rtpengine_table *table, const struct rtpengine_stream_idx_info *info) {
-	int err;
-	struct re_call *call;
-	struct re_stream *stream;
-
-	DBG("table_del_stream()\n");
-
-	call = get_call_lock(table, info->call_idx);
-	err = -ENOENT;
-	if (!call)
-		return -ENOENT;
-
-	stream = get_stream_lock(call, info->stream_idx);
-	err = -ENOENT;
-	if (!stream)
-		goto out;
-
-	del_stream(stream, table);
-
-	err = 0;
-
-out:
-	call_put(call);
-	return err;
-}
-
-
-
 
 static ssize_t proc_stream_read(struct file *f, char __user *b, size_t l, loff_t *o) {
 	struct re_stream *stream = f->private_data;
@@ -3887,17 +3984,17 @@ static int target_find_ssrc(struct rtpengine_target *g, uint32_t ssrc) {
 	return -2;
 }
 
-static void parse_rtcp(struct rtp_parsed *rtp, struct sk_buff *skb) {
+static void parse_rtcp(struct rtp_parsed *rtp, unsigned int datalen, char *data) {
 	rtp->ok = 0;
 	rtp->rtcp = 0;
 
-	if (skb->len < sizeof(struct rtcp_header))
+	if (datalen < sizeof(struct rtcp_header))
 		return;
 
-	rtp->rtcp_header = (void *) skb->data;
+	rtp->rtcp_header = (struct rtcp_header *) data;
 	rtp->header_len = sizeof(struct rtcp_header);
-	rtp->payload = skb->data + sizeof(struct rtcp_header);
-	rtp->payload_len = skb->len - sizeof(struct rtcp_header);
+	rtp->payload = data + sizeof(struct rtcp_header);
+	rtp->payload_len = datalen - sizeof(struct rtcp_header);
 	rtp->rtcp = 1;
 }
 
@@ -4051,7 +4148,7 @@ static bool re_ring_send(const void *payload, size_t length,
 	data = skb_put(skb, length);
 	memcpy(data, payload, length);
 
-	send_proxy_packet(skb, src, dst, tos, NULL);
+	send_proxy_packet(skb, src, dst, tos, NULL, NULL, NULL);
 
 	return true;
 }
@@ -4090,7 +4187,7 @@ static int re_ring_sender(void *p) {
 			struct rtpengine_buf_slot *slot = &slots[s];
 			struct rtpengine_buf_metadata *metaslot = &metadata[s];
 
-			if (! re_ring_send(slot->steps[0].offset + buf->head, slot->steps[0].length,
+			if (!re_ring_send(slot->steps[0].offset + buf->head, slot->steps[0].length,
 					&metaslot->src, &metaslot->dst, metaslot->tos))
 				atomic_inc(&pair->errors);
 		}
@@ -4314,15 +4411,14 @@ static void free_packet_stream(struct re_play_stream_packets *stream) {
 	list_for_each_entry_safe(packet, tp, &stream->packets, list)
 		free_play_stream_packet(packet);
 
-	if (stream->table_id != -1 && !list_empty(&stream->table_entry)) {
-		t = get_table(stream->table_id);
-		if (t) {
-			spin_lock(&t->player_lock);
-			list_del_init(&stream->table_entry);
-			t->num_packet_streams--;
-			spin_unlock(&t->player_lock);
-			table_put(t);
-		}
+	t = stream->table;
+	if (t) {
+		spin_lock(&t->player_lock);
+		list_del_init(&stream->table_entry);
+		t->num_packet_streams--;
+		spin_unlock(&t->player_lock);
+		stream->table = NULL;
+		table_put(t);
 	}
 	kfree(stream);
 }
@@ -4464,7 +4560,8 @@ static void play_stream_send_packet(struct re_play_stream *stream, struct re_pla
 	rtp.rtcp = 0;
 
 	proxy_packet_srtp_encrypt(skb, &stream->encrypt, &stream->info.encrypt, &rtp, 0, &stream->info.ssrc_stats);
-	send_proxy_packet(skb, &stream->info.src_addr, &stream->info.dst_addr, stream->info.tos, NULL);
+	send_proxy_packet(skb, &stream->info.src_addr, &stream->info.dst_addr, stream->info.tos,
+			NULL, NULL, NULL);
 
 	atomic64_inc(&stream->info.stats->packets);
 	atomic64_add(packet->len, &stream->info.stats->bytes);
@@ -4524,7 +4621,7 @@ static int timer_worker(void *p) {
 
 			spin_lock(&stream->lock);
 
-			if (stream->table_id == -1) {
+			if (!stream->table) {
 				// we've been descheduled
 				spin_unlock(&stream->lock);
 				unref_play_stream(stream);
@@ -4549,7 +4646,7 @@ static int timer_worker(void *p) {
 
 				spin_lock(&stream->lock);
 
-				if (stream->table_id != -1)
+				if (stream->table)
 					play_stream_next_packet(stream);
 				else
 					stream->position = NULL;
@@ -4751,7 +4848,8 @@ static int get_packet_stream(struct rtpengine_table *t, unsigned int *num) {
 	INIT_LIST_HEAD(&new_stream->packets);
 	INIT_LIST_HEAD(&new_stream->table_entry);
 	rwlock_init(&new_stream->lock);
-	new_stream->table_id = t->id;
+	new_stream->table = t;
+	ref_get(t);
 	atomic_set(&new_stream->refcnt, 1);
 
 	for (i = 0; i < num_stream_packets; i++) {
@@ -4888,7 +4986,8 @@ static int play_stream(struct rtpengine_table *t, const struct rtpengine_play_st
 
 	INIT_LIST_HEAD(&play_stream->table_entry);
 	play_stream->info = *info;
-	play_stream->table_id = t->id;
+	play_stream->table = t;
+	ref_get(t);
 	atomic_set(&play_stream->refcnt, 1);
 	spin_lock_init(&play_stream->lock);
 	play_stream->info.stats = stats;
@@ -4985,19 +5084,22 @@ out:
 static void end_of_stream(struct re_play_stream *stream) {
 	struct rtpengine_table *t;
 
-	if (stream->table_id != -1 && !list_empty(&stream->table_entry)) {
-		t = get_table(stream->table_id);
-		if (t) {
-			//printk(KERN_WARNING "removing stream %p from table\n", stream);
-			spin_lock(&t->player_lock);
-			list_del_init(&stream->table_entry);
-			t->num_play_streams--;
-			spin_unlock(&t->player_lock);
-			table_put(t);
-			unref_play_stream(stream);
-		}
-	}
-	stream->table_id = -1;
+	if (list_empty(&stream->table_entry))
+		return;
+
+	t = stream->table;
+	if (!t)
+		return;
+
+	//printk(KERN_WARNING "removing stream %p from table\n", stream);
+	spin_lock(&t->player_lock);
+	list_del_init(&stream->table_entry);
+	t->num_play_streams--;
+	spin_unlock(&t->player_lock);
+	unref_play_stream(stream);
+
+	table_put(t);
+	stream->table = NULL;
 }
 
 // stream lock is not held, reference must be held
@@ -5108,7 +5210,8 @@ out:
 
 	write_lock(&stream->lock);
 	idx = stream->idx;
-	stream->table_id = -1;
+	table_put(stream->table);
+	stream->table = NULL;
 	write_unlock(&stream->lock);
 
 	if (idx != -1) {
@@ -5144,7 +5247,6 @@ static const size_t min_req_sizes[__REMG_LAST] = {
 	[REMG_ADD_CALL]		= sizeof(struct rtpengine_command_add_call),
 	[REMG_DEL_CALL]		= sizeof(struct rtpengine_command_del_call),
 	[REMG_ADD_STREAM]	= sizeof(struct rtpengine_command_add_stream),
-	[REMG_DEL_STREAM]	= sizeof(struct rtpengine_command_del_stream),
 	[REMG_PACKET]		= sizeof(struct rtpengine_command_packet),
 	[REMG_INIT_PLAY_STREAMS]= sizeof(struct rtpengine_command_init_play_streams),
 	[REMG_GET_PACKET_STREAM]= sizeof(struct rtpengine_command_get_packet_stream),
@@ -5164,7 +5266,6 @@ static const size_t max_req_sizes[__REMG_LAST] = {
 	[REMG_ADD_CALL]		= sizeof(struct rtpengine_command_add_call),
 	[REMG_DEL_CALL]		= sizeof(struct rtpengine_command_del_call),
 	[REMG_ADD_STREAM]	= sizeof(struct rtpengine_command_add_stream),
-	[REMG_DEL_STREAM]	= sizeof(struct rtpengine_command_del_stream),
 	[REMG_PACKET]		= sizeof(struct rtpengine_command_packet) + 65535,
 	[REMG_INIT_PLAY_STREAMS]= sizeof(struct rtpengine_command_init_play_streams),
 	[REMG_GET_PACKET_STREAM]= sizeof(struct rtpengine_command_get_packet_stream),
@@ -5195,8 +5296,6 @@ static int rtpengine_init_table(struct rtpengine_table *t, struct rtpengine_init
 static inline ssize_t proc_control_read_write(struct file *file, char __user *ubuf, size_t buflen,
 		int writeable)
 {
-	struct inode *inode;
-	uint32_t id;
 	struct rtpengine_table *t;
 	int err;
 	enum rtpengine_command cmd;
@@ -5256,9 +5355,7 @@ static inline ssize_t proc_control_read_write(struct file *file, char __user *ub
 		msg.storage = scratchbuf;
 
 	// get our table
-	inode = file->f_path.dentry->d_inode;
-	id = (uint32_t) (unsigned long) PDE_DATA(inode);
-	t = get_table(id);
+	t = file->private_data;
 	err = -ENOENT;
 	if (!t)
 		goto err_free;
@@ -5266,7 +5363,7 @@ static inline ssize_t proc_control_read_write(struct file *file, char __user *ub
 	// copy in the entire request
 	err = -EFAULT;
 	if (copy_from_user(msg.storage, ubuf, buflen))
-		goto err_table_free;
+		goto err_free;
 
 	// execute command
 	err = 0;
@@ -5302,10 +5399,6 @@ static inline ssize_t proc_control_read_write(struct file *file, char __user *ub
 			err = -EINVAL;
 			if (writeable)
 				err = table_new_stream(t, &msg.add_stream->stream);
-			break;
-
-		case REMG_DEL_STREAM:
-			err = table_del_stream(t, &msg.del_stream->stream);
 			break;
 
 		case REMG_PACKET:
@@ -5360,8 +5453,6 @@ static inline ssize_t proc_control_read_write(struct file *file, char __user *ub
 			break;
 	}
 
-	table_put(t);
-
 	if (err)
 		goto err_free;
 
@@ -5376,8 +5467,6 @@ static inline ssize_t proc_control_read_write(struct file *file, char __user *ub
 
 	return buflen;
 
-err_table_free:
-	table_put(t);
 err_free:
 	if (msg.storage != scratchbuf)
 		kfree(msg.storage);
@@ -5396,19 +5485,26 @@ static ssize_t proc_control_read(struct file *file, char __user *ubuf, size_t bu
 
 
 static int send_proxy_packet4(struct sk_buff *skb, const struct re_address *src, const struct re_address *dst,
-		unsigned char tos, struct net *net)
+		unsigned char tos, struct net *net, struct dst_entry *dst_entry, struct rtpengine_table *t)
 {
 	struct iphdr *ih;
 	struct udphdr *uh;
 	unsigned int datalen;
-	struct rtable *rt;
 
-	if (!net && current && current->nsproxy)
-		net = current->nsproxy->net_ns;
-	if (!net)
+	if (!dst_entry || !net)
 		goto drop;
 
 	datalen = skb->len;
+
+	if (skb_headroom(skb) < sizeof(*uh) + sizeof(*ih)) {
+		struct sk_buff *skb2 = skb_copy_expand(skb, MAX_HEADER, MAX_SKB_TAIL_ROOM, GFP_ATOMIC);
+		if (!skb2)
+			goto drop;
+		if (t)
+			atomic64_inc(&t->skb_copies);
+		kfree_skb(skb);
+		skb = skb2;
+	}
 
 	uh = (void *) skb_push(skb, sizeof(*uh));
 	skb_reset_transport_header(skb);
@@ -5442,20 +5538,10 @@ static int send_proxy_packet4(struct sk_buff *skb, const struct re_address *src,
 	 * a Cilium-internal routing table that has no default gateway. */
 	skb->mark = 0;
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,10,0)) || \
-		(defined(RHEL_RELEASE_CODE) && LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0) && \
-			RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9,6))
-	rt = ip_route_output(net, dst->u.ipv4, src->u.ipv4, tos, 0, 0);
-#else
-	rt = ip_route_output(net, dst->u.ipv4, src->u.ipv4, tos, 0);
-#endif
-	if (IS_ERR(rt))
-		goto drop;
 	skb_dst_drop(skb);
-	skb_dst_set(skb, &rt->dst);
+	dst_hold(dst_entry);
+	skb_dst_set(skb, dst_entry);
 
-	if (skb_dst(skb)->error)
-		goto drop;
 	skb->dev = skb_dst(skb)->dev;
 
 	if (skb->dev->features & (NETIF_F_HW_CSUM | NETIF_F_IP_CSUM)) {
@@ -5503,20 +5589,26 @@ drop:
 
 
 static int send_proxy_packet6(struct sk_buff *skb, const struct re_address *src, const struct re_address *dst,
-		unsigned char tos, struct net *net)
+		unsigned char tos, struct net *net, struct dst_entry *dst_entry, struct rtpengine_table *t)
 {
 	struct ipv6hdr *ih;
 	struct udphdr *uh;
 	unsigned int datalen;
-	struct dst_entry *dst_entry;
-	struct flowi6 fl6;
 
-	if (!net && current && current->nsproxy)
-		net = current->nsproxy->net_ns;
-	if (!net)
+	if (!dst_entry || !net)
 		goto drop;
 
 	datalen = skb->len;
+
+	if (skb_headroom(skb) < sizeof(*uh) + sizeof(*ih)) {
+		struct sk_buff *skb2 = skb_copy_expand(skb, MAX_HEADER, MAX_SKB_TAIL_ROOM, GFP_ATOMIC);
+		if (!skb2)
+			goto drop;
+		if (t)
+			atomic64_inc(&t->skb_copies);
+		kfree_skb(skb);
+		skb = skb2;
+	}
 
 	uh = (void *) skb_push(skb, sizeof(*uh));
 	skb_reset_transport_header(skb);
@@ -5547,20 +5639,9 @@ static int send_proxy_packet6(struct sk_buff *skb, const struct re_address *src,
 	 * marks to avoid misrouting via Cilium-internal tables. */
 	skb->mark = 0;
 
-	memset(&fl6, 0, sizeof(fl6));
-	memcpy(&fl6.saddr, src->u.ipv6, sizeof(fl6.saddr));
-	memcpy(&fl6.daddr, dst->u.ipv6, sizeof(fl6.daddr));
-	fl6.flowi6_mark = skb->mark;
-
-	dst_entry = ip6_route_output(net, NULL, &fl6);
-	if (!dst_entry)
-		goto drop;
-	if (dst_entry->error) {
-		dst_release(dst_entry);
-		goto drop;
-	}
 	skb_dst_drop(skb);
 	skb_dst_set(skb, dst_entry);
+	dst_hold(dst_entry);
 	skb->dev = skb_dst(skb)->dev;
 
 	skb->csum_start = skb_transport_header(skb) - skb->head;
@@ -5596,30 +5677,52 @@ drop:
 
 
 static int send_proxy_packet(struct sk_buff *skb, const struct re_address *src, const struct re_address *dst,
-		unsigned char tos, struct net *net)
+		unsigned char tos, struct net *net, struct dst_entry *dst_entry, struct rtpengine_table *t)
 {
+	int ret = -1;
+	struct dst_entry *local_dst = NULL;
+
 	if (src->family != dst->family) {
 		log_err("address family mismatch");
-		goto drop;
+		goto out;
 	}
+
+	/* This skb was received from the network but is now being reinjected as
+	 * a new locally generated packet. Drop inherited routing, conntrack, and
+	 * netfilter metadata before handing it to the IP output path. */
+	skb_scrub_packet(skb, true);
 
 	switch (src->family) {
 		case AF_INET:
-			return send_proxy_packet4(skb, src, dst, tos, net);
+			if (!dst_entry) {
+				local_dst = dst_entry = get_output_dst4(net, src, dst, tos);
+				if (!local_dst || local_dst->error)
+					break;
+			}
+			ret = send_proxy_packet4(skb, src, dst, tos, net, dst_entry, t);
+			skb = NULL;
 			break;
 
 		case AF_INET6:
-			return send_proxy_packet6(skb, src, dst, tos, net);
+			if (!dst_entry) {
+				local_dst = dst_entry = get_output_dst6(net, src, dst);
+				if (!local_dst || local_dst->error)
+					break;
+			}
+			ret = send_proxy_packet6(skb, src, dst, tos, net, dst_entry, t);
+			skb = NULL;
 			break;
 
 		default:
 			log_err("unsupported address family");
-			goto drop;
 	}
 
-drop:
-	kfree_skb(skb);
-	return -1;
+	dst_release(local_dst);
+
+out:
+	if (skb)
+		kfree_skb(skb);
+	return ret;
 }
 
 
@@ -5628,22 +5731,22 @@ drop:
 
 
 /* XXX shared code */
-static void parse_rtp(struct rtp_parsed *rtp, struct sk_buff *skb) {
+static void parse_rtp(struct rtp_parsed *rtp, unsigned int datalen, char *data) {
 	size_t ext_len;
 
-	if (skb->len < sizeof(*rtp->rtp_header))
+	if (datalen < sizeof(*rtp->rtp_header))
 		goto error;
-	rtp->rtp_header = (void *) skb->data;
+	rtp->rtp_header = (struct rtp_header *) data;
 	if ((rtp->rtp_header->v_p_x_cc & 0xc0) != 0x80) /* version 2 */
 		goto error;
 	rtp->header_len = sizeof(*rtp->rtp_header);
 
 	/* csrc list */
 	rtp->header_len += (rtp->rtp_header->v_p_x_cc & 0xf) * 4;
-	if (skb->len < rtp->header_len)
+	if (datalen < rtp->header_len)
 		goto error;
-	rtp->payload = skb->data + rtp->header_len;
-	rtp->payload_len = skb->len - rtp->header_len;
+	rtp->payload = data + rtp->header_len;
+	rtp->payload_len = datalen - rtp->header_len;
 
 	if ((rtp->rtp_header->v_p_x_cc & 0x10)) {
 		/* extension */
@@ -6376,36 +6479,36 @@ static inline int srtcp_decrypt(struct re_crypto_context *c,
 }
 
 
-static inline bool is_muxed_rtcp(struct sk_buff *skb) {
+static inline bool is_muxed_rtcp(unsigned int datalen, const char *data) {
 	// XXX shared code
 	unsigned char m_pt;
-	if (skb->len < 8) // minimum RTCP size
+	if (datalen < 8) // minimum RTCP size
 		return false;
-	m_pt = skb->data[1];
+	m_pt = data[1];
 	if (m_pt < 194)
 		return false;
 	if (m_pt > 223)
 		return false;
 	return true;
 }
-static inline int is_rtcp_fb_packet(struct sk_buff *skb) {
+static inline int is_rtcp_fb_packet(unsigned int datalen, const char *data) {
 	unsigned char m_pt;
-	size_t left = skb->len;
-	size_t offset = 0;
+	unsigned int left = datalen;
+	unsigned int offset = 0;
 	unsigned int packets = 0;
 	uint16_t len;
 
 	while (1) {
 		if (left < 8) // minimum RTCP size
 			return 0;
-		m_pt = skb->data[offset + 1];
+		m_pt = data[offset + 1];
 		// only RTPFB and PSFB
 		if (m_pt != 205 && m_pt != 206)
 			return 0;
 
 		// length check
-		len = (((unsigned char) skb->data[offset + 2]) << 8)
-			| ((unsigned char) skb->data[offset + 3]);
+		len = ((data[offset + 2]) << 8)
+			| data[offset + 3];
 		len++;
 		len <<= 2;
 		if (len > left) // invalid
@@ -6438,12 +6541,12 @@ static inline int is_stun(struct rtpengine_target *g, unsigned int datalen, unsi
 	return 1; // probably STUN
 }
 
-static inline int is_dtls(struct sk_buff *skb) {
-	if (skb->len < 1)
+static inline int is_dtls(unsigned int datalen, const char *data) {
+	if (datalen < 1)
 		return 0;
-	if (skb->data[0] < 20)
+	if (data[0] < 20)
 		return 0;
-	if (skb->data[0] > 63)
+	if (data[0] > 63)
 		return 0;
 	return 1;
 }
@@ -6520,6 +6623,37 @@ static struct sk_buff *intercept_skb_copy(struct sk_buff *oskb, const struct re_
 	return ret;
 }
 
+
+static struct sk_buff *rtpe_skb_cpy(const struct sk_buff *oskb, const struct rtp_parsed *rtp,
+		struct rtp_parsed *rtp2, struct rtpengine_table *t)
+{
+	struct sk_buff *skb;
+	long offset;
+
+	skb = skb_copy_expand(oskb, MAX_HEADER, MAX_SKB_TAIL_ROOM, GFP_ATOMIC);
+	if (!skb)
+		return NULL;
+
+	atomic64_inc(&t->skb_copies);
+
+	if (!rtp)
+		return skb;
+
+	// adjust RTP pointers
+	*rtp2 = *rtp;
+	offset = skb->data - oskb->data;
+	if (rtp->rtp_header)
+		rtp2->rtp_header = (void *) (((char *) rtp2->rtp_header) + offset);
+	rtp2->payload = (void *) (((char *) rtp2->payload) + offset);
+	if (rtp2->extension)
+		rtp2->extension = (void *) (((char *) rtp2->extension) + offset);
+	if (rtp2->ext_hdr)
+		rtp2->ext_hdr = (void *) (((char *) rtp2->ext_hdr) + offset);
+
+	return skb;
+}
+
+
 static void proxy_packet_output_rtcp(struct sk_buff *skb, struct rtpengine_output *o,
 		struct rtp_parsed *rtp, int ssrc_idx)
 {
@@ -6565,16 +6699,16 @@ static uint32_t proxy_packet_srtp_encrypt(struct sk_buff *skb, struct re_crypto_
 
 #include "extmap_filter.inc.c"
 
-static bool proxy_packet_output_rtXp(struct sk_buff *skb, struct rtpengine_output *o,
+static struct sk_buff *proxy_packet_output_rtXp(struct sk_buff *skb, struct rtpengine_output *o,
 		int rtp_pt_idx,
-		struct rtp_parsed *rtp, int ssrc_idx)
+		struct rtp_parsed *rtp, int ssrc_idx, struct rtpengine_table *t)
 {
 	int i;
 	uint32_t pkt_idx;
 
 	if (!rtp->ok) {
 		proxy_packet_output_rtcp(skb, o, rtp, ssrc_idx);
-		return true;
+		return skb;
 	}
 
 	if (o->output.extmap)
@@ -6583,12 +6717,12 @@ static bool proxy_packet_output_rtXp(struct sk_buff *skb, struct rtpengine_outpu
 	if (rtp_pt_idx >= 0) {
 		// blackhole?
 		if (o->output.pt_output[rtp_pt_idx].blackhole)
-			return false;
+			goto drop;
 
 		// pattern rewriting
 		if (o->output.pt_output[rtp_pt_idx].min_payload_len
 				&& rtp->payload_len < o->output.pt_output[rtp_pt_idx].min_payload_len)
-			return false;
+			goto drop;
 
 		if (o->output.pt_output[rtp_pt_idx].replace_pattern_len) {
 			if (o->output.pt_output[rtp_pt_idx].replace_pattern_len == 1)
@@ -6612,6 +6746,15 @@ static bool proxy_packet_output_rtXp(struct sk_buff *skb, struct rtpengine_outpu
 			rtp->rtp_header->ssrc = o->output.ssrc_out[ssrc_idx];
 	}
 
+	// copy to encrypt/authenticate needed?
+	if (o->output.encrypt.hmac != REH_NULL || o->encrypt_rtp.cipher->encrypt_rtp) {
+		struct sk_buff *skb2 = rtpe_skb_cpy(skb, rtp, rtp, t);
+		if (!skb2)
+			goto drop;
+		kfree_skb(skb);
+		skb = skb2;
+	}
+
 	pkt_idx = proxy_packet_srtp_encrypt(skb, &o->encrypt_rtp, &o->output.encrypt,
 			rtp, ssrc_idx, o->output.ssrc_stats);
 
@@ -6622,20 +6765,24 @@ static bool proxy_packet_output_rtXp(struct sk_buff *skb, struct rtpengine_outpu
 		atomic_set(&o->output.ssrc_stats[ssrc_idx]->timestamp, ntohl(rtp->rtp_header->timestamp));
 	}
 
-	return true;
+	return skb;
+
+drop:
+	kfree_skb(skb);
+	return NULL;
 }
 
 static int send_proxy_packet_output(struct sk_buff *skb, struct rtpengine_target *g,
 		int rtp_pt_idx,
 		struct rtpengine_output *o, struct rtp_parsed *rtp, int ssrc_idx,
-		struct net *net)
+		struct rtpengine_table *t)
 {
-	bool send_or_not = proxy_packet_output_rtXp(skb, o, rtp_pt_idx, rtp, ssrc_idx);
-	if (!send_or_not) {
-		kfree_skb(skb);
+	skb = proxy_packet_output_rtXp(skb, o, rtp_pt_idx, rtp, ssrc_idx, t);
+	if (!skb)
 		return 0;
-	}
-	return send_proxy_packet(skb, &o->output.src_addr, &o->output.dst_addr, o->output.tos, net);
+	return send_proxy_packet(skb,
+			&o->output.src_addr, &o->output.dst_addr,
+			o->output.tos, o->net, o->dst, t);
 }
 
 
@@ -6846,8 +6993,9 @@ static int ring_buffer_insert(int action, struct rtpengine_table *t, struct rtpe
 		struct re_ring_buffer *rr;
 
 		unsigned int idx = (iter + cur) % num;
+		int buf_idx;
 		pair = rc->ring_buffers[idx];
-		int buf_idx = atomic_read(pair->buf_idx);
+		buf_idx = atomic_read(pair->buf_idx);
 
 		if (buf_idx != 0 && buf_idx != 1) {
 			atomic_inc(&pair->errors);
@@ -6932,13 +7080,17 @@ static int ring_buffer_insert(int action, struct rtpengine_table *t, struct rtpe
 		// If we want to be notified to run as soon as possible, do
 		// it now. Otherwise, notify if somebody is waiting to run.
 		if (pair->run_now_event)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,8,0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,8,0) || \
+    (LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0) && \
+     defined(RHEL_RELEASE_CODE) && RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9,0))
 			eventfd_signal_mask(pair->run_now_event, EPOLLIN);
 #else
 			eventfd_signal(pair->run_now_event, 1);
 #endif
 		else if (readers != 0 && pair->writers_done_event)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,8,0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,8,0) || \
+    (LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0) && \
+     defined(RHEL_RELEASE_CODE) && RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9,0))
 			eventfd_signal_mask(pair->writers_done_event, EPOLLIN);
 #else
 			eventfd_signal(pair->writers_done_event, 1);
@@ -6949,21 +7101,29 @@ static int ring_buffer_insert(int action, struct rtpengine_table *t, struct rtpe
 }
 
 
-static int rtpengine46(struct sk_buff *skb, struct sk_buff *oskb,
+// pull past the transport (UDP) header and trim to correct length
+static void rtpe_pull_trim(struct sk_buff *skb, unsigned int datalen) {
+	skb_gso_reset(skb);
+	skb_pull(skb, skb->transport_header - skb->network_header + sizeof(struct udphdr));
+	skb_trim(skb, datalen);
+}
+
+
+static int rtpengine46(struct sk_buff *oskb,
 		struct rtpengine_table *t, struct re_address *src,
-		struct re_address *dst, uint8_t in_tos, struct net *net)
+		struct re_address *dst, uint8_t in_tos)
 {
+	struct sk_buff *skb = NULL;
 	struct udphdr *uh;
 	struct rtpengine_target *g;
 	struct sk_buff *skb2;
 	int err;
-	int error_nf_action = NFT_CONTINUE;
-	int nf_action = NF_DROP;
+	int nf_action = NFT_CONTINUE;
 	int rtp_pt_idx = -2;
 	int ssrc_idx = -1;
+	unsigned char *data;
 	unsigned int datalen, datalen_out;
 	struct rtp_parsed rtp, rtp2;
-	ssize_t offset;
 	uint32_t pkt_idx;
 	struct re_stream *stream;
 	struct re_stream_packet *packet;
@@ -6976,39 +7136,47 @@ static int rtpengine46(struct sk_buff *skb, struct sk_buff *oskb,
 	unsigned int output_group_idx = 0;
 	struct rtpengine_output_group *output_group;
 
-	skb_reset_transport_header(skb);
-	uh = udp_hdr(skb);
-	skb_pull(skb, sizeof(*uh));
-
-	datalen = ntohs(uh->len);
-	if (datalen < sizeof(*uh))
-		goto out_no_target;
-	datalen -= sizeof(*uh);
-	DBG("udp payload = %u\n", datalen);
-	skb_trim(skb, datalen);
+	uh = udp_hdr(oskb);
 
 	src->port = ntohs(uh->source);
 	dst->port = ntohs(uh->dest);
 
 	g = get_target(t, dst);
 	if (!g)
-		goto out_no_target;
+		return NFT_CONTINUE;
+
+	DBG("target found, local " MIPF "\n", MIPP(g->target.local));
+	DBG("target decrypt RTP hmac and cipher are %s and %s", g->decrypt_rtp.hmac->name,
+			g->decrypt_rtp.cipher->name);
+
+	datalen = ntohs(uh->len);
+	if (datalen < sizeof(*uh))
+		goto out_target;
+	datalen -= sizeof(*uh);
+	DBG("udp payload = %u\n", datalen);
 
 	// all our outputs filled?
 	_r_lock(&g->outputs_lock, flags);
 	if (g->outputs_unfilled) {
 		// pass to application
 		_r_unlock(&g->outputs_lock, flags);
-		goto out;
+		goto out_target;
 	}
 	_r_unlock(&g->outputs_lock, flags);
 
-	DBG("target found, local " MIPF "\n", MIPP(g->target.local));
-	DBG("target decrypt RTP hmac and cipher are %s and %s", g->decrypt_rtp.hmac->name,
-			g->decrypt_rtp.cipher->name);
+	// prepare to access payload of packet. make sure it's a flat buffer
+	// XXX could be smarter about this, we usually just need the header
+	if (skb_needs_linearize(oskb, 0)) {
+		skb = rtpe_skb_cpy(oskb, NULL, NULL, t);
+		if (!skb)
+			goto out_error;
+		uh = udp_hdr(skb);
+	}
 
-	if (is_stun(g, datalen, skb->data))
-		goto out;
+	data = ((unsigned char *) uh) + sizeof(*uh);
+
+	if (is_stun(g, datalen, data))
+		goto out_target;
 
 	// source checks;
 	if (g->target.src_mismatch == MSM_IGNORE)
@@ -7016,22 +7184,24 @@ static int rtpengine46(struct sk_buff *skb, struct sk_buff *oskb,
 	else if (!memcmp(&g->target.expected_src, src, sizeof(*src)))
 		; // source matched
 	else if (g->target.src_mismatch == MSM_PROPAGATE)
-		goto out; // source mismatched, pass to userspace
+		goto out_target; // source mismatched, pass to userspace
 	else {
 		/* MSM_DROP */
-		error_nf_action = NF_DROP;
+		nf_action = NF_DROP;
 		errstr = "source address mismatch";
 		goto out_error;
 	}
 
-	packet_ts = ktime_to_us(skb->tstamp);
+	packet_ts = ktime_to_us(oskb->tstamp);
 
-	if (g->target.dtls && is_dtls(skb))
-		goto out;
+	if (g->target.dtls && is_dtls(datalen, data))
+		goto out_target;
 	if (g->target.non_forwarding && !g->target.do_intercept) {
-		if (g->target.blackhole)
+		if (g->target.blackhole) {
+			nf_action = NF_DROP;
 			goto do_stats; // and drop
-		goto out; // pass to userspace
+		}
+		goto out_target; // pass to userspace
 	}
 
 	// RTP processing
@@ -7039,26 +7209,27 @@ static int rtpengine46(struct sk_buff *skb, struct sk_buff *oskb,
 	rtp.rtcp = 0;
 	is_rtcp = NOT_RTCP;
 	if (g->target.rtp) {
-		if (is_muxed_rtcp(skb)) {
+		if (is_muxed_rtcp(datalen, data)) {
 			is_rtcp = RTCP;
-			if (g->target.rtcp_fb_fw && is_rtcp_fb_packet(skb))
+			if (g->target.rtcp_fb_fw && is_rtcp_fb_packet(datalen, data))
 				; // forward and then drop
 			else if (g->target.rtcp_fw)
 				is_rtcp = RTCP_FORWARD; // forward, mark, and pass to userspace
 			else
-				goto out; // just pass to userspace
+				goto out_action; // just pass to userspace
 
-			parse_rtcp(&rtp, skb);
+			parse_rtcp(&rtp, datalen, data);
 			if (!rtp.rtcp)
-				goto out;
+				goto out_action;
 		}
 		else {
 			// not RTCP
-			parse_rtp(&rtp, skb);
+			parse_rtp(&rtp, datalen, data);
 			if (!rtp.ok && g->target.rtp_only)
-				goto out; // pass to userspace
+				goto out_action; // pass to userspace
 		}
 	}
+
 	if (rtp.ok) {
 		// RTP ok
 		rtp_pt_idx = rtp_payload_type(rtp.rtp_header, &g->target, &g->last_pt);
@@ -7077,6 +7248,15 @@ static int rtpengine46(struct sk_buff *skb, struct sk_buff *oskb,
 
 		pkt_idx = rtp_packet_index(&g->decrypt_rtp, &g->target.decrypt, rtp.rtp_header, ssrc_idx,
 				g->target.ssrc_stats);
+
+		// copy to decrypt/authenticate needed?
+		if (!skb && (g->target.decrypt.hmac != REH_NULL || g->decrypt_rtp.cipher->decrypt_rtp)) {
+			errstr = "out of memory";
+			skb = rtpe_skb_cpy(oskb, &rtp, &rtp, t);
+			if (!skb)
+				goto out_error;
+		}
+
 		errstr = "SRTP authentication tag mismatch";
 		if (srtp_auth_validate(&g->decrypt_rtp, &g->target.decrypt, &rtp, &pkt_idx, ssrc_idx,
 					g->target.ssrc_stats))
@@ -7085,7 +7265,7 @@ static int rtpengine46(struct sk_buff *skb, struct sk_buff *oskb,
 		// if RTP, only forward packets of known/passthrough payload types
 		if (rtp_pt_idx < 0) {
 			if (g->target.pt_filter)
-				goto out;
+				goto out_action;
 		}
 		else {
 			if (output_group_idx == -1u)
@@ -7102,6 +7282,18 @@ static int rtpengine46(struct sk_buff *skb, struct sk_buff *oskb,
 		err = srtp_decrypt(&g->decrypt_rtp, &g->target.decrypt, &rtp, &pkt_idx);
 		if (err < 0)
 			goto out_error;
+
+		// everything passed, we will definitely handle this packet
+		nf_action = NF_DROP;
+
+		// if we haven't made a copy yet, we can use the original skb directly
+		if (!skb) {
+			skb = skb_get(oskb);
+			atomic64_inc(&t->skb_refs);
+		}
+
+		rtpe_pull_trim(skb, datalen);
+
 		if (err == 1)
 			update_packet_index(&g->decrypt_rtp, &g->target.decrypt, pkt_idx, ssrc_idx,
 					g->target.ssrc_stats);
@@ -7120,6 +7312,18 @@ static int rtpengine46(struct sk_buff *skb, struct sk_buff *oskb,
 	}
 	else if (is_rtcp != NOT_RTCP && rtp.rtcp) {
 		pkt_idx = 0;
+
+		// always make a copy for RTCP
+		// (even if technically not needed for NF_DROP case below)
+		if (!skb) {
+			errstr = "out of memory";
+			skb = rtpe_skb_cpy(oskb, &rtp, &rtp, t);
+			if (!skb)
+				goto out_error;
+		}
+
+		rtpe_pull_trim(skb, datalen);
+
 		err = srtcp_auth_validate(&g->decrypt_rtcp, &g->target.decrypt, &rtp, &pkt_idx);
 		errstr = "SRTCP authentication tag mismatch";
 		if (err == -1)
@@ -7134,8 +7338,19 @@ static int rtpengine46(struct sk_buff *skb, struct sk_buff *oskb,
 		if (is_rtcp == RTCP_FORWARD) {
 			// mark packet as "handled" with negative timestamp
 			oskb->tstamp = (ktime_t) {-ktime_to_ns(oskb->tstamp)};
-			nf_action = NFT_CONTINUE;
 		}
+		else
+			nf_action = NF_DROP;
+	}
+	else {
+		// forward non-RTP/RTCP. no copy needed
+		if (!skb) {
+			skb = skb_get(oskb);
+			atomic64_inc(&t->skb_refs);
+		}
+		nf_action = NF_DROP;
+
+		rtpe_pull_trim(skb, datalen);
 	}
 
 	if (g->target.do_intercept) {
@@ -7168,11 +7383,11 @@ static int rtpengine46(struct sk_buff *skb, struct sk_buff *oskb,
 		if (i == (end_idx - 1)) {
 			skb2 = skb; // last iteration - use original
 			skb = NULL;
-			offset = 0;
+			rtp2 = rtp;
 		}
 		else {
 			// make copy
-			skb2 = skb_copy_expand(skb, MAX_HEADER, MAX_SKB_TAIL_ROOM, GFP_ATOMIC);
+			skb2 = rtpe_skb_cpy(skb, &rtp, &rtp2, t);
 			if (!skb2) {
 				log_err("out of memory while creating skb copy");
 				atomic64_inc(&g->target.stats->errors);
@@ -7180,22 +7395,11 @@ static int rtpengine46(struct sk_buff *skb, struct sk_buff *oskb,
 				atomic64_inc(&t->rtpe_stats->errors_kernel);
 				continue;
 			}
-			skb_gso_reset(skb2);
-			offset = skb2->data - skb->data;
 		}
-		// adjust RTP pointers
-		rtp2 = rtp;
-		if (rtp.rtp_header)
-			rtp2.rtp_header = (void *) (((char *) rtp2.rtp_header) + offset);
-		rtp2.payload = (void *) (((char *) rtp2.payload) + offset);
-		if (rtp2.extension)
-			rtp2.extension = (void *) (((char *) rtp2.extension) + offset);
-		if (rtp2.ext_hdr)
-			rtp2.ext_hdr = (void *) (((char *) rtp2.ext_hdr) + offset);
 
 		datalen_out = skb2->len;
 
-		err = send_proxy_packet_output(skb2, g, rtp_pt_idx, o, &rtp2, ssrc_idx, net);
+		err = send_proxy_packet_output(skb2, g, rtp_pt_idx, o, &rtp2, ssrc_idx, t);
 		if (err) {
 			atomic64_inc(&g->target.stats->errors);
 			atomic64_inc(&g->target.iface_stats->in.errors);
@@ -7233,26 +7437,26 @@ do_stats:
 		atomic64_inc(&g->target.iface_stats->in.errors);
 	}
 
-	target_put(g);
-	table_put(t);
-	if (skb)
-		kfree_skb(skb);
-
-	return nf_action;
+	// no error
+	goto out_action;
 
 out_error:
 	log_err("x_tables action failed: %s", errstr);
 	atomic64_inc(&g->target.stats->errors);
 	atomic64_inc(&g->target.iface_stats->in.errors);
 	atomic64_inc(&t->rtpe_stats->errors_kernel);
-out:
-	error_nf_action = ring_buffer_insert(error_nf_action, t, g, &g->raw_ring_buf,
-			g->target.raw_ring_buf.num, src, &g->target.local, skb, ktime_to_us(oskb->tstamp));
+
+out_action:
+	if (skb) {
+		nf_action = ring_buffer_insert(nf_action, t, g, &g->raw_ring_buf,
+				g->target.raw_ring_buf.num, src, &g->target.local,
+				skb, ktime_to_us(oskb->tstamp));
+		kfree_skb(skb);
+	}
+
+out_target:
 	target_put(g);
-out_no_target:
-	kfree_skb(skb);
-	table_put(t);
-	return error_nf_action;
+	return nf_action;
 }
 
 
@@ -7260,26 +7464,14 @@ out_no_target:
 
 
 
-static int rtpengine4(struct sk_buff *oskb, struct net *net, uint32_t table_id) {
-	struct sk_buff *skb;
+static int rtpengine4(struct sk_buff *oskb, struct rtpengine_table *t) {
 	struct iphdr *ih;
-	struct rtpengine_table *t;
 	struct re_address src, dst;
 
-	t = get_table(table_id);
-	if (!t)
-		goto skip;
+	ih = ip_hdr(oskb);
 
-	skb = skb_copy_expand(oskb, MAX_HEADER, MAX_SKB_TAIL_ROOM, GFP_ATOMIC);
-	if (!skb)
-		goto skip3;
-
-	skb_gso_reset(skb);
-	skb_reset_network_header(skb);
-	ih = ip_hdr(skb);
-	skb_pull(skb, (ih->ihl << 2));
 	if (ih->protocol != IPPROTO_UDP)
-		goto skip2;
+		return NFT_CONTINUE;
 
 	memset(&src, 0, sizeof(src));
 	memset(&dst, 0, sizeof(dst));
@@ -7288,45 +7480,34 @@ static int rtpengine4(struct sk_buff *oskb, struct net *net, uint32_t table_id) 
 	dst.family = AF_INET;
 	dst.u.ipv4 = ih->daddr;
 
-	return rtpengine46(skb, oskb, t, &src, &dst, (uint8_t)ih->tos, net);
-
-skip2:
-	kfree_skb(skb);
-skip3:
-	table_put(t);
-skip:
-	return NFT_CONTINUE;
+	return rtpengine46(oskb, t, &src, &dst, (uint8_t)ih->tos);
 }
 
 static unsigned int rtpe_xt_rtpengine4(struct sk_buff *oskb, const struct xt_action_param *par) {
 	const struct xt_rtpengine_info *pinfo = par->targinfo;
-	return rtpengine4(oskb, PAR_STATE_NET(par), pinfo->id);
+	unsigned int ret;
+	struct rtpengine_table *t = get_table(pinfo->id);
+	if (!t)
+		return NFT_CONTINUE;
+
+	ret = rtpengine4(oskb, t);
+
+	table_put(t);
+
+	return ret;
 }
 
 
 
 
-static int rtpengine6(struct sk_buff *oskb, struct net *net, uint32_t table_id) {
-	struct sk_buff *skb;
+static int rtpengine6(struct sk_buff *oskb, struct rtpengine_table *t) {
 	struct ipv6hdr *ih;
-	struct rtpengine_table *t;
 	struct re_address src, dst;
 
-	t = get_table(table_id);
-	if (!t)
-		goto skip;
+	ih = ipv6_hdr(oskb);
 
-	skb = skb_copy_expand(oskb, MAX_HEADER, MAX_SKB_TAIL_ROOM, GFP_ATOMIC);
-	if (!skb)
-		goto skip3;
-
-	skb_gso_reset(skb);
-	skb_reset_network_header(skb);
-	ih = ipv6_hdr(skb);
-
-	skb_pull(skb, sizeof(*ih));
 	if (ih->nexthdr != IPPROTO_UDP)
-		goto skip2;
+		return NFT_CONTINUE;
 
 	memset(&src, 0, sizeof(src));
 	memset(&dst, 0, sizeof(dst));
@@ -7335,19 +7516,21 @@ static int rtpengine6(struct sk_buff *oskb, struct net *net, uint32_t table_id) 
 	dst.family = AF_INET6;
 	memcpy(&dst.u.ipv6, &ih->daddr, sizeof(dst.u.ipv6));
 
-	return rtpengine46(skb, oskb, t, &src, &dst, ipv6_get_dsfield(ih), net);
-
-skip2:
-	kfree_skb(skb);
-skip3:
-	table_put(t);
-skip:
-	return NFT_CONTINUE;
+	return rtpengine46(oskb, t, &src, &dst, ipv6_get_dsfield(ih));
 }
 
 static unsigned int rtpe_xt_rtpengine6(struct sk_buff *oskb, const struct xt_action_param *par) {
 	const struct xt_rtpengine_info *pinfo = par->targinfo;
-	return rtpengine6(oskb, PAR_STATE_NET(par), pinfo->id);
+	unsigned int ret;
+	struct rtpengine_table *t = get_table(pinfo->id);
+	if (!t)
+		return NFT_CONTINUE;
+
+	ret = rtpengine6(oskb, t);
+
+	table_put(t);
+
+	return ret;
 }
 
 
@@ -7372,16 +7555,16 @@ static int check(const struct xt_tgchk_param *par) {
 static void rtpengine_ipv4_expr_eval(const struct nft_expr *expr, struct nft_regs *regs,
 		const struct nft_pktinfo *pkt)
 {
-	struct xt_rtpengine_info *info = (struct xt_rtpengine_info *) expr->data;
-	int verdict = rtpengine4(pkt->skb, PKTINFO_NET(pkt), info->id);
+	struct nft_rtpengine_info *info = (struct nft_rtpengine_info *) expr->data;
+	int verdict = rtpengine4(pkt->skb, info->table);
 	regs->verdict.code = verdict;
 }
 
 static void rtpengine_ipv6_expr_eval(const struct nft_expr *expr, struct nft_regs *regs,
 		const struct nft_pktinfo *pkt)
 {
-	struct xt_rtpengine_info *info = (struct xt_rtpengine_info *) expr->data;
-	int verdict = rtpengine6(pkt->skb, PKTINFO_NET(pkt), info->id);
+	struct nft_rtpengine_info *info = (struct nft_rtpengine_info *) expr->data;
+	int verdict = rtpengine6(pkt->skb, info->table);
 	regs->verdict.code = verdict;
 }
 
@@ -7402,7 +7585,9 @@ static int rtpengine_expr_init(const struct nft_ctx *ctx, const struct nft_expr 
 		const struct nlattr * const tb[])
 {
 	uint32_t table;
-	struct xt_rtpengine_info *info = (struct xt_rtpengine_info *) expr->data;
+	struct nft_rtpengine_info *info = (struct nft_rtpengine_info *) expr->data;
+	bool crt;
+	bool excl;
 
 	if (!tb[RTPEA_RTPENGINE_TABLE])
 		return -EINVAL;
@@ -7412,9 +7597,31 @@ static int rtpengine_expr_init(const struct nft_ctx *ctx, const struct nft_expr 
 	if (table >= MAX_ID)
 		return -ERANGE;
 
-	info->id = table;
+	crt = !!tb[RTPEA_RTPENGINE_CREAT];
+	excl = !!tb[RTPEA_RTPENGINE_EXCL];
+
+	info->table = get_table(table);
+	if (!info->table) {
+		if (!crt)
+			return -ENOENT;
+		info->table = new_table_link(table);
+		if (!info->table)
+			return -EBUSY;
+	}
+	else {
+		if (excl) {
+			table_put(info->table);
+			info->table = NULL;
+			return -EEXIST;
+		}
+	}
 
 	return 0;
+}
+
+static void rtpengine_expr_destroy(const struct nft_ctx *ctx, const struct nft_expr *expr) {
+	struct nft_rtpengine_info *info = (struct nft_rtpengine_info *) expr->data;
+	table_put(info->table);
 }
 
 static int rtpengine_expr_dump(struct sk_buff *skb, const struct nft_expr *expr
@@ -7425,9 +7632,9 @@ static int rtpengine_expr_dump(struct sk_buff *skb, const struct nft_expr *expr
 #endif
 )
 {
-	struct xt_rtpengine_info *info = (struct xt_rtpengine_info *) expr->data;
+	struct nft_rtpengine_info *info = (struct nft_rtpengine_info *) expr->data;
 
-	nla_put_u32(skb, RTPEA_RTPENGINE_TABLE, info->id);
+	nla_put_u32(skb, RTPEA_RTPENGINE_TABLE, info->table->id);
 
 	return 0;
 }
@@ -7448,42 +7655,47 @@ static struct nft_expr_type rtpengine_ipv6_expr;
 
 static const struct nft_expr_ops rtpengine_inet_ops = {
 	.type			= &rtpengine_inet_expr,
-	.size			= NFT_EXPR_SIZE(sizeof(struct xt_rtpengine_info)),
+	.size			= NFT_EXPR_SIZE(sizeof(struct nft_rtpengine_info)),
 	.eval			= rtpengine_inet_expr_eval,
 	.init			= rtpengine_expr_init,
+	.destroy		= rtpengine_expr_destroy,
 	.dump			= rtpengine_expr_dump,
 	.validate		= rtpengine_expr_validate,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,17,0)
+#ifdef NFT_REDUCE_READONLY
 	.reduce			= NFT_REDUCE_READONLY,
 #endif
 };
 
 static const struct nft_expr_ops rtpengine_ipv4_ops = {
 	.type			= &rtpengine_ipv4_expr,
-	.size			= NFT_EXPR_SIZE(sizeof(struct xt_rtpengine_info)),
+	.size			= NFT_EXPR_SIZE(sizeof(struct nft_rtpengine_info)),
 	.eval			= rtpengine_ipv4_expr_eval,
 	.init			= rtpengine_expr_init,
+	.destroy		= rtpengine_expr_destroy,
 	.dump			= rtpengine_expr_dump,
 	.validate		= rtpengine_expr_validate,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,17,0)
+#ifdef NFT_REDUCE_READONLY
 	.reduce			= NFT_REDUCE_READONLY,
 #endif
 };
 
 static const struct nft_expr_ops rtpengine_ipv6_ops = {
 	.type			= &rtpengine_ipv6_expr,
-	.size			= NFT_EXPR_SIZE(sizeof(struct xt_rtpengine_info)),
+	.size			= NFT_EXPR_SIZE(sizeof(struct nft_rtpengine_info)),
 	.eval			= rtpengine_ipv6_expr_eval,
 	.init			= rtpengine_expr_init,
+	.destroy		= rtpengine_expr_destroy,
 	.dump			= rtpengine_expr_dump,
 	.validate		= rtpengine_expr_validate,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,17,0)
+#ifdef NFT_REDUCE_READONLY
 	.reduce			= NFT_REDUCE_READONLY,
 #endif
 };
 
 static const struct nla_policy rtpengine_policy[RTPEA_RTPENGINE_MAX + 1] = {
 	[RTPEA_RTPENGINE_TABLE]		= { .type = NLA_U32 },
+	[RTPEA_RTPENGINE_CREAT]		= { .type = NLA_FLAG },
+	[RTPEA_RTPENGINE_EXCL]		= { .type = NLA_FLAG },
 };
 
 static struct nft_expr_type rtpengine_inet_expr __read_mostly = {

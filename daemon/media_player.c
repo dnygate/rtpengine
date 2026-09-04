@@ -7,7 +7,7 @@
 #endif
 
 #include "obj.h"
-#include "log.h"
+#include "log_d.h"
 #include "timerthread.h"
 #include "call.h"
 #include "call_interfaces.h"
@@ -16,11 +16,10 @@
 #include "codec.h"
 #include "media_socket.h"
 #include "ssrc.h"
-#include "log_funcs.h"
 #include "main.h"
 #include "rtcp.h"
 #ifdef WITH_TRANSCODING
-#include "fix_frame_channel_layout.h"
+#include "fix_frame_channel_layout.compat"
 #endif
 #include "kernel.h"
 #include "bufferpool.h"
@@ -75,7 +74,7 @@ struct media_player_cache_entry {
 
 	cache_packet_arr *packets; // read-only except for decoder thread, which uses finished flags and locks
 	unsigned long duration; // cumulative in ms, summed up while decoding
-	unsigned int kernel_idx; // -1 if not in use
+	unsigned int kernel_idx; // KERNEL_IDX_NONE if not in use
 	media_player_ht wait_queue; // players waiting on decoder to finish
 
 	struct codec_scheduler csch;
@@ -193,7 +192,7 @@ static void media_player_shutdown(struct media_player *mp) {
 	mp->media = NULL;
 	media_player_coder_shutdown(&mp->coder);
 
-	if (mp->kernel_idx != -1)
+	if (mp->kernel_idx != KERNEL_IDX_NONE)
 		kernel_stop_stream_player(mp->kernel_idx);
 	else if (mp->cache_entry) {
 		mutex_lock(&mp->cache_entry->lock);
@@ -208,7 +207,7 @@ static void media_player_shutdown(struct media_player *mp) {
 	mp->cache_index.file = STR_NULL;// coverity[missing_lock : FALSE]
 	obj_release(mp->cache_entry); // coverity[missing_lock : FALSE]
 	mp->cache_read_idx = 0;
-	mp->kernel_idx = -1;
+	mp->kernel_idx = KERNEL_IDX_NONE;
 }
 #endif
 
@@ -246,7 +245,7 @@ void media_player_new(struct media_player **mpp, struct call_monologue *ml, stru
 	struct media_player *mp;
 
 	if (!(mp = *mpp)) {
-		//ilog(LOG_DEBUG, "creating media_player");
+		ilog(LOG_DEBUG, "creating media_player");
 
 		mp = *mpp = obj_alloc0(struct media_player, __media_player_free);
 
@@ -255,7 +254,7 @@ void media_player_new(struct media_player **mpp, struct call_monologue *ml, stru
 
 		mp->tt_obj.tt = &media_player_thread;
 		mutex_init(&mp->lock);
-		mp->kernel_idx = -1;
+		mp->kernel_idx = KERNEL_IDX_NONE;
 
 		mp->run_func = media_player_read_packet; // default
 		mp->call = obj_get(ml->call);
@@ -290,10 +289,10 @@ static void __send_timer_free(void *p) {
 
 static void __send_timer_send_now(struct timerthread_queue *ttq, void *p) {
 	send_timer_send_nolock((void *) ttq, p);
-};
+}
 static void __send_timer_send_later(struct timerthread_queue *ttq, void *p) {
 	send_timer_send_lock((void *) ttq, p);
-};
+}
 
 // call->master_lock held in W
 struct send_timer *send_timer_new(struct packet_stream *ps) {
@@ -372,7 +371,7 @@ static bool __send_timer_send_1(struct rtp_header *rh, struct packet_stream *sin
 	req->buf = bufferpool_ref(cp->s.s);
 	uring_methods.sendmsg(&sink_fd->socket, &req->msg, &sink->endpoint, &req->sin, &req->req);
 
-	if (sink->call->recording && rtpe_config.rec_egress) {
+	if (sink->call->recording && (rtpe_config.rec_egress || rtpe_config.rec_both)) {
 		// fill in required members
 		struct media_packet mp = {
 			.call = sink->call,
@@ -380,6 +379,7 @@ static bool __send_timer_send_1(struct rtp_header *rh, struct packet_stream *sin
 			.media = sink->media,
 			.sfd = sink_fd,
 			.fsin = sink->endpoint,
+			.recording_egress = true,
 		};
 		dump_packet(&mp, cp->plain.s ? &cp->plain : &cp->s);
 	}
@@ -484,13 +484,6 @@ void send_timer_push(struct send_timer *st, struct codec_packet *cp) {
 #ifdef WITH_TRANSCODING
 
 
-#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(57, 26, 0)
-#define CODECPAR codecpar
-#else
-#define CODECPAR codec
-#endif
-
-
 typedef union {
 	struct media_player_cache_entry *entry;
 	struct media_player *mp;
@@ -501,9 +494,9 @@ static void media_player_coder_add_packet(struct media_player_coder *c,
 		int64_t us_dur, unsigned long long pts), media_player_coder_add_packet_arg p) {
 	// scale pts and duration according to sample rate
 
-	int64_t duration_scaled = c->pkt->duration * c->avstream->CODECPAR->sample_rate
+	int64_t duration_scaled = c->pkt->duration * c->avstream->codecpar->sample_rate
 		* c->avstream->time_base.num / c->avstream->time_base.den;
-	unsigned long long pts_scaled = c->pkt->pts * c->avstream->CODECPAR->sample_rate
+	unsigned long long pts_scaled = c->pkt->pts * c->avstream->codecpar->sample_rate
 		* c->avstream->time_base.num / c->avstream->time_base.den;
 
 	int64_t us_dur = c->pkt->duration * 1000000LL * c->avstream->time_base.num
@@ -515,7 +508,7 @@ static void media_player_coder_add_packet(struct media_player_coder *c,
 			pts_scaled,
 			duration_scaled,
 			us_dur,
-			c->avstream->CODECPAR->sample_rate,
+			c->avstream->codecpar->sample_rate,
 			c->avstream->time_base.num, c->avstream->time_base.den);
 
 	fn(p, (char *) c->pkt->data, c->pkt->size, us_dur, pts_scaled);
@@ -639,7 +632,7 @@ static void media_player_kernel_player_start_now(struct media_player *mp) {
 	mp->sink.handler->out->kernel(&info.encrypt, mp->sink.sink);
 
 	unsigned int idx = kernel_start_stream_player(&info);
-	if (idx == -1)
+	if (idx == KERNEL_IDX_NONE)
 		ilog(LOG_ERR, "Failed to start kernel media player (index %i): %s", info.packet_stream_idx, strerror(errno));
 	else
 		mp->kernel_idx = idx;
@@ -678,7 +671,7 @@ static void media_player_cached_reader_start(struct media_player *mp, str_case_v
 
 	__media_player_set_opts(mp, mp->opts);
 
-	if (entry->kernel_idx != -1) {
+	if (entry->kernel_idx != KERNEL_IDX_NONE) {
 		media_player_kernel_player_start(mp);
 		return;
 	}
@@ -773,10 +766,10 @@ static bool media_player_cache_get_entry(struct media_player *mp,
 
 	t_hash_table_insert(media_player_cache, ins_key, obj_get(entry));
 
-	entry->kernel_idx = -1;
+	entry->kernel_idx = KERNEL_IDX_NONE;
 	if (kernel.use_player) {
 		entry->kernel_idx = kernel_get_packet_stream();
-		if (entry->kernel_idx == -1)
+		if (entry->kernel_idx == KERNEL_IDX_NONE)
 			ilog(LOG_ERR, "Failed to get kernel packet stream entry (%s)", strerror(errno));
 		else
 			ilog(LOG_DEBUG, "Using kernel packet stream index %i", entry->kernel_idx);
@@ -868,7 +861,7 @@ static void packet_encoded_cache(struct codec_ssrc_handler *ch, struct media_pac
 	mutex_lock(&entry->lock);
 	t_ptr_array_add(entry->packets, ep);
 
-	if (entry->kernel_idx != -1) {
+	if (entry->kernel_idx != KERNEL_IDX_NONE) {
 		ilog(LOG_DEBUG, "Adding media packet (length %zu, TS %" PRIu64 ", delay %lu ms) to kernel packet stream %i",
 				s->len, pts, entry->duration, entry->kernel_idx);
 		if (!kernel_add_stream_packet(entry->kernel_idx, s->s, s->len, entry->duration, pts,
@@ -1039,23 +1032,23 @@ static int __ensure_codec_handler(struct media_player *mp, const rtp_payload_typ
 
 	// synthesise rtp payload type
 	rtp_payload_type src_pt = { .payload_type = -1 };
-	src_pt.codec_def = codec_def_make_generic_av(mp->coder.avstream->CODECPAR->codec_id);
+	src_pt.codec_def = codec_def_make_generic_av(mp->coder.avstream->codecpar->codec_id);
 	if (!src_pt.codec_def || !src_pt.codec_def->support_decoding) {
 		ilog(LOG_ERR, "Attempting to play media from an unsupported file format/codec");
 		return -1;
 	}
 
-	if (!GET_CHANNELS(mp->coder.avstream->CODECPAR) || !mp->coder.avstream->CODECPAR->sample_rate)
+	if (!GET_CHANNELS(mp->coder.avstream->codecpar) || !mp->coder.avstream->codecpar->sample_rate)
 		__probe_format(mp);
 
-	if (!GET_CHANNELS(mp->coder.avstream->CODECPAR) || !mp->coder.avstream->CODECPAR->sample_rate) {
+	if (!GET_CHANNELS(mp->coder.avstream->codecpar) || !mp->coder.avstream->codecpar->sample_rate) {
 		ilog(LOG_ERR, "Unrecognised audio format, cannot do playback");
 		return -1;
 	}
 
 	src_pt.encoding = src_pt.codec_def->rtpname_str;
-	src_pt.channels = GET_CHANNELS(mp->coder.avstream->CODECPAR);
-	src_pt.clock_rate = mp->coder.avstream->CODECPAR->sample_rate;
+	src_pt.channels = GET_CHANNELS(mp->coder.avstream->codecpar);
+	src_pt.clock_rate = mp->coder.avstream->codecpar->sample_rate;
 
 	codec_init_payload_type(&src_pt, MT_AUDIO);
 
@@ -1212,6 +1205,9 @@ void media_player_set_media(struct media_player *mp, struct call_media *media) {
 		struct ssrc_entry_call *ssrc_ctx = get_ssrc(mp->ssrc, &media->ssrc_hash_out);
 		if (ssrc_ctx)
 			ssrc_ctx->next_rtcp = rtpe_now;
+		/* get_ssrc() returns an owned reference.
+		 * hence release previous ssrc, to no leak on media changes */
+		ssrc_entry_release(mp->ssrc_out);
 		mp->ssrc_out = ssrc_ctx;
 	}
 }
@@ -1255,6 +1251,8 @@ static const rtp_payload_type *media_player_play_init(struct media_player *mp) {
 static bool media_player_play_start(struct media_player *mp, const rtp_payload_type *dst_pt,
 		str_case_value_ht codec_set)
 {
+	int ret = 0;
+
 	// needed to have usable duration for some formats. ignore errors.
 	if (!mp->coder.fmtctx->streams || !mp->coder.fmtctx->streams[0])
 		avformat_find_stream_info(mp->coder.fmtctx, NULL);
@@ -1280,10 +1278,14 @@ static bool media_player_play_start(struct media_player *mp, const rtp_payload_t
 	// if start_pos is positive, try to seek to that position
 	if (mp->opts.start_pos > 0) {
 		ilog(LOG_DEBUG, "Seeking to position %lli", mp->opts.start_pos);
-		av_seek_frame(mp->coder.fmtctx, 0, mp->opts.start_pos, AVSEEK_FLAG_ANY | AVSEEK_FLAG_BACKWARD);
+		ret = av_seek_frame(mp->coder.fmtctx, 0, mp->opts.start_pos, AVSEEK_FLAG_ANY | AVSEEK_FLAG_BACKWARD);
 	}
 	else // in case this is a repeated start
-		av_seek_frame(mp->coder.fmtctx, 0, 0, AVSEEK_FLAG_ANY | AVSEEK_FLAG_BACKWARD);
+		ret = av_seek_frame(mp->coder.fmtctx, 0, 0, AVSEEK_FLAG_ANY | AVSEEK_FLAG_BACKWARD);
+
+	if (ret < 0)
+		ilog(LOG_ERR, "Failed to seek to beginning of media file");
+		// should we return false at this point?
 
 	media_player_read_packet(mp);
 
@@ -1707,9 +1709,17 @@ const char * call_play_media_for_ml(struct call_monologue *ml,
 
 	/* this starts the audio player if needed */
 	update_init_monologue_subscribers(ml, OP_PLAY_MEDIA);
-	/* media_player_new() now knows that audio player is in use
-	 * TODO: player options can have changed if already exists */
-	media_player_new(&ml->player, ml, NULL, &opts);
+
+	if (ml->player && ml->player->opts.moh) {
+		ilog(LOG_DEBUG, "There is already ongoing media playback for MoH. Ignore new one.");
+		/* pretend that everything is good */
+		return NULL;
+	}
+	else {
+		/* media_player_new() now knows that audio player is in use
+		* TODO: player options can have changed if already exists */
+		media_player_new(&ml->player, ml, NULL, &opts);
+	}
 
 	if (opts.file.len) {
 		if (!media_player_play_file(ml->player, opts))
@@ -1734,6 +1744,8 @@ const char * call_play_media_for_ml(struct call_monologue *ml,
 long long call_stop_media_for_ml(struct call_monologue *ml)
 {
 #ifdef WITH_TRANSCODING
+	if (!ml->player)
+		return 0;
 	long long ret = media_player_stop(ml->player);
 	/* restore to non-mixing if needed */
 	codec_update_all_source_handlers(ml);
@@ -1853,6 +1865,7 @@ err:
 	ilog(LOG_ERR, "Failed to start media playback from memory: %s", err);
 	if (av_ret)
 		ilog(LOG_ERR, "Error returned from libav: %s", av_error(av_ret));
+	media_player_coder_shutdown(&mp->coder);
 	return MPC_ERR;
 }
 
@@ -1971,17 +1984,20 @@ success:;
 	unsigned long *lengths = mysql_fetch_lengths(res);
 	err = "empty result from database";
 	if (!row || !lengths || !row[0] || !lengths[0]) {
-		mysql_free_result(res);
-		goto err;
+		goto release_res;
 	}
 
 	err = "failed to insert data into cache";
 	if (!cache_fn(row[0], lengths[0], id))
-		goto err;
+		goto release_res;
 
 	*out = dup_fn(row[0], lengths[0]);
+	mysql_free_result(res);
 	return NULL;
 
+release_res:
+	if (res)
+		mysql_free_result(res);
 err:
 	if (query)
 		ilog(LOG_ERR, "Failed to read media from database (used query '%s'): %s", query, err);
@@ -2155,7 +2171,8 @@ static void __media_player_cache_entry_free(struct media_player_cache_entry *e) 
 	}
 	media_player_coder_shutdown(&e->coder);
 	av_packet_free(&e->coder.pkt);
-	kernel_free_packet_stream(e->kernel_idx);
+	if (e->kernel_idx != KERNEL_IDX_NONE)
+		kernel_free_packet_stream(e->kernel_idx);
 	g_free(e->index.index.file.s);
 	payload_type_clear(&e->index.dst_pt);
 	memory_arena_free(&e->arena);
@@ -2215,7 +2232,7 @@ void media_player_launch(void) {
 }
 void send_timer_launch(void) {
 	//ilog(LOG_DEBUG, "send_timer_loop");
-	timerthread_launch(&send_timer_thread, rtpe_config.scheduling, rtpe_config.priority, "media player");
+	timerthread_launch(&send_timer_thread, rtpe_config.scheduling, rtpe_config.priority, "send timer");
 }
 
 bool media_player_preload_files(char **files) {
@@ -2304,8 +2321,9 @@ bool media_player_add_cached_file(str *name) {
 	LOCK(&media_player_media_files_lock);
 	__auto_type foold = t_hash_table_lookup(media_player_media_files, name);
 	if (foold) {
+		str *key = foold->str_link->data;
 		fonew->str_link = foold->str_link;
-		t_hash_table_replace(media_player_media_files, name, fonew);
+		t_hash_table_replace(media_player_media_files, key, fonew);
 		obj_put(foold);
 	}
 	else
@@ -2483,7 +2501,7 @@ static bool __media_player_evict_file(str *name) {
 	}
 
 	obj_put(val);
-	g_free(key);
+	str_free(key);
 
 	return true;
 }
@@ -2655,6 +2673,9 @@ GQueue media_player_list_caches(void) {
 	return ret;
 }
 
+/**
+ * Returns mtime and atime in microseconds.
+ */
 bool media_player_get_cache_times(unsigned long long id, int64_t *mtime, int64_t *atime) {
 #ifdef WITH_TRANSCODING
 	g_autoptr(char) fn = media_player_make_cache_entry_name(id);
@@ -2662,8 +2683,8 @@ bool media_player_get_cache_times(unsigned long long id, int64_t *mtime, int64_t
 	int fail = stat(fn, &sb);
 	if (fail)
 		return false;
-	*mtime = sb.st_mtim.tv_sec;
-	*atime = sb.st_atim.tv_sec;
+	*mtime = (sb.st_mtim.tv_sec) * 1000000LL;
+	*atime = (sb.st_atim.tv_sec) * 1000000LL;
 	return true;
 #else
 	return false;
@@ -2827,10 +2848,10 @@ unsigned int media_player_evict_player_caches(void) {
 
 #ifdef WITH_TRANSCODING
 static void media_player_expire_files(void) {
-	if (rtpe_config.media_expire_us <= 0)
+	if (rtpe_config.media_files_expire_us <= 0)
 		return;
 
-	int64_t limit = rtpe_now - rtpe_config.media_expire_us;
+	int64_t limit = rtpe_now - rtpe_config.media_files_expire_us;
 	unsigned int num = 0;
 
 	{
@@ -2858,10 +2879,10 @@ static void media_player_expire_files(void) {
 }
 
 static void media_player_expire_dbs(void) {
-	if (rtpe_config.db_expire_us <= 0)
+	if (rtpe_config.db_media_expire_us <= 0)
 		return;
 
-	int64_t limit = rtpe_now - rtpe_config.db_expire_us;
+	int64_t limit = rtpe_now - rtpe_config.db_media_expire_us;
 	unsigned int num = 0;
 
 	{
@@ -2892,7 +2913,7 @@ static void media_player_expire_cache_entry(unsigned long long id, unsigned int 
 	int64_t mtime, atime;
 	if (!media_player_get_cache_times(id, &mtime, &atime))
 		return;
-	int64_t limit = rtpe_now - rtpe_config.db_expire_us;
+	int64_t limit = rtpe_now - rtpe_config.db_cache_expire_us;
 	if (atime >= limit)
 		return;
 	if (media_player_evict_cache(id))
@@ -2900,7 +2921,7 @@ static void media_player_expire_cache_entry(unsigned long long id, unsigned int 
 }
 
 static void media_player_expire_caches(void) {
-	if (rtpe_config.cache_expire <= 0)
+	if (rtpe_config.db_cache_expire_us <= 0)
 		return;
 
 	unsigned int ret = 0;
