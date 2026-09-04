@@ -1998,6 +1998,10 @@ static void kernelize(struct packet_stream *stream) {
 			struct sink_handler *sh = l->data;
 			if (sh->attrs.block_media)
 				continue;
+			// forced egress SSRC is only implemented in userspace
+			if (sh->sink->media && sh->sink->media->monologue
+					&& sh->sink->media->monologue->force_egress_ssrc)
+				goto no_kernel;
 			bool ok = kernelize_one_sink_handler(&s, stream, sh, false);
 			if (!ok)
 				goto retry;
@@ -2005,6 +2009,10 @@ static void kernelize(struct packet_stream *stream) {
 		// RTP egress mirrors
 		for (__auto_type l = s.rtp_mirrors[mi]->head; l; l = l->next) {
 			struct sink_handler *sh = l->data;
+			// forced egress SSRC is only implemented in userspace
+			if (sh->sink->media && sh->sink->media->monologue
+					&& sh->sink->media->monologue->force_egress_ssrc)
+				goto no_kernel;
 			bool ok = kernelize_one_sink_handler(&s, stream, sh, false);
 			if (!ok)
 				goto retry;
@@ -3112,6 +3120,21 @@ static void media_packet_set_encrypt(struct packet_handler_ctx *phc, struct sink
 
 int media_packet_encrypt(rewrite_func encrypt_func, struct packet_stream *out, struct media_packet *mp) {
 	int ret = 0x00; // 0x01 = error, 0x02 = update
+
+	/* Forced egress SSRC: rewrite the SSRC of every outgoing RTP packet
+	 * sent towards a party for which one was set. This is done ahead of the
+	 * early return below so that it also applies to unencrypted RTP, and
+	 * ahead of encryption so that the SRTP authentication tag covers the
+	 * rewritten header. RTCP is left untouched. */
+	if (!mp->rtcp && out->media && out->media->monologue && out->media->monologue->force_egress_ssrc) {
+		uint32_t ssrc = htonl(out->media->monologue->force_egress_ssrc);
+		IQUEUE_FOREACH(&mp->packets_out, p) {
+			str payload;
+			struct rtp_header *rh = rtp_payload(&payload, &p->s, NULL);
+			if (rh)
+				rh->ssrc = ssrc;
+		}
+	}
 
 	if (!encrypt_func)
 		return 0x00;

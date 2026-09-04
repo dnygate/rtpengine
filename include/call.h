@@ -614,6 +614,7 @@ struct call_monologue {
 	str_q			tag_aliases;
 	enum tag_type		tagtype;
 	str			label;
+	uint32_t		force_egress_ssrc;	/* forced SSRC for RTP sent towards this party, 0 = unset */
 	int64_t			created_us;		/* RO */
 	int64_t			deleted_us;
 	int64_t			started;		/* for CDR */

@@ -138,6 +138,10 @@ struct sdp_ng_flags {
 		MEO_BKW,
 		MEO_BOTH,
 	} media_echo:3;
+	struct {
+		uint32_t egress_to_offerer;	/* forced SSRC for RTP sent towards the offerer, 0 = unset */
+		uint32_t egress_to_answerer;	/* forced SSRC for RTP sent towards the answerer, 0 = unset */
+	} ssrc_force;
 	enum {
 		ALL_NONE = 0,
 		ALL_ALL,

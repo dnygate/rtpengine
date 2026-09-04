@@ -3843,6 +3843,18 @@ int monologue_offer_answer(struct call_monologue *monologues[2], sdp_streams_q *
 
 	__call_monologue_init_from_flags(sender_ml, receiver_ml, flags);
 
+	/* Forced egress SSRCs: remember them on the monologue of the party the
+	 * respective SSRC is meant for. The sender of an offer is the offerer,
+	 * otherwise the sender is the answerer. */
+	if (flags->ssrc_force.egress_to_offerer || flags->ssrc_force.egress_to_answerer) {
+		struct call_monologue *offerer_ml = is_offer ? sender_ml : receiver_ml;
+		struct call_monologue *answerer_ml = is_offer ? receiver_ml : sender_ml;
+		if (offerer_ml && flags->ssrc_force.egress_to_offerer)
+			offerer_ml->force_egress_ssrc = flags->ssrc_force.egress_to_offerer;
+		if (answerer_ml && flags->ssrc_force.egress_to_answerer)
+			answerer_ml->force_egress_ssrc = flags->ssrc_force.egress_to_answerer;
+	}
+
 	if (flags->exclude_recording) {
 		ML_SET(receiver_ml, NO_RECORDING);
 		ML_SET(sender_ml, NO_RECORDING);

@@ -100,6 +100,51 @@ static const char *ng_sdes_option(str *s, unsigned int idx, helper_arg arg) {
 	return NULL;
 }
 
+/* Parses an SSRC value given either as an integer or as a decimal or
+ * `0x`-prefixed hexadecimal string. Returns 0 (meaning unset) for a zero
+ * value or if the value is invalid. */
+static uint32_t call_ng_parse_ssrc(const ng_parser_t *parser, parser_arg value) {
+	str s;
+	long long v;
+
+	if (parser->get_str(value, &s)) {
+		char buf[32];
+		size_t n = MIN(s.len, sizeof(buf) - 1);
+		memcpy(buf, s.s, n);
+		buf[n] = '\0';
+		char *end = buf;
+		v = strtoll(buf, &end, 0);
+		if (end == buf || *end != '\0')
+			v = -1;
+	}
+	else
+		v = parser->get_int_str(value, -1);
+
+	if (v < 0 || v > UINT32_MAX) {
+		ilog(LOG_WARN, "Invalid SSRC value given, ignoring");
+		return 0;
+	}
+	return v;
+}
+
+static const char *call_ng_flags_ssrc(const ng_parser_t *parser, str *key, parser_arg value, helper_arg arg) {
+	sdp_ng_flags *out = arg.flags;
+	switch (__csh_lookup(key)) {
+		case CSH_LOOKUP("egress-to-offerer"):
+		case CSH_LOOKUP("egress to offerer"):
+			out->ssrc_force.egress_to_offerer = call_ng_parse_ssrc(parser, value);
+			break;
+		case CSH_LOOKUP("egress-to-answerer"):
+		case CSH_LOOKUP("egress to answerer"):
+			out->ssrc_force.egress_to_answerer = call_ng_parse_ssrc(parser, value);
+			break;
+		default:
+			ilog(LOG_WARN, "Unknown 'SSRC' flag encountered: '" STR_FORMAT "'",
+					STR_FMT(key));
+	}
+	return NULL;
+}
+
 static const char *ng_osrtp_option(str *s, unsigned int idx, helper_arg arg) {
 	sdp_ng_flags *out = arg.flags;
 
@@ -1819,6 +1864,9 @@ const char *call_ng_main_flags(const ng_parser_t *parser, str *key, parser_arg v
 		case CSH_LOOKUP("OSRTP"):
 		case CSH_LOOKUP("osrtp"):
 			return call_ng_flags_str_list(parser, value, ng_osrtp_option, out);
+		case CSH_LOOKUP("SSRC"):
+		case CSH_LOOKUP("ssrc"):
+			return parser->dict_iter(parser, value, call_ng_flags_ssrc, out);
 		case CSH_LOOKUP("outbound-peer"):
 		case CSH_LOOKUP("outbound peer"):
 			call_ng_flags_peer_address(&s, &out->direction[1], "Outbound");

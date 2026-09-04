@@ -811,6 +811,31 @@ Optionally included keys are:
         and accepted, while DTLS would be rejected. Useful in combination with
         `DTLS=off`.
 
+* `SSRC`
+
+	Contains a dictionary to control SSRC handling. The contained keys
+	`egress-to-offerer` and `egress-to-answerer` each take an SSRC value,
+	given either as an integer or as a decimal or `0x`-prefixed hexadecimal
+	string. *rtpengine* then rewrites the SSRC of every RTP packet it sends
+	towards the offerer (the party that sent the offer) or towards the
+	answerer (the party that answered it), respectively, to the given
+	value.
+
+	This is useful when a downstream system, such as a WebRTC selective
+	forwarding unit (SFU), must bind a receiver to an SSRC chosen by the
+	controlling application rather than discover it from the media itself.
+
+	Either or both keys may be given, in an `offer` as well as in an
+	`answer`. The setting persists for the lifetime of the call. The
+	rewrite applies to all outgoing RTP, regardless of whether the media is
+	being transcoded or passed through, and takes place before SRTP
+	encryption. RTCP is not rewritten. A value of `0` is ignored.
+
+	Media sent towards a party with a forced SSRC is always forwarded in
+	userspace and is excluded from kernel packet forwarding.
+
+	Example in string syntax: `SSRC=[egress-to-answerer=0x12345678]`
+
 * `supports`
 
 	Contains a list of strings. Each string indicates support for an additional feature
